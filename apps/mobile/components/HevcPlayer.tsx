@@ -1,0 +1,3342 @@
+/**
+ * HevcPlayer — Generic native video player using expo-video.
+ *
+ * Plays direct video URLs (MKV/MP4/WebM) with hardware-accelerated decoding.
+ * Accepts either a single videoUrl or an array of StreamLinks (direct provider).
+ *
+ * UX stage machine (what the user sees):
+ *   connecting → playing
+ *        └→ switching ("Trying source X of Y …") → playing | error
+ *   error   → card with human reason + Retry / Choose source / Go back
+ *   exhausted → card with Re-check all / Choose manually / Go back
+ *
+ * The probe machinery now classifies links as valid / dead / unknown:
+ * timeouts never blacklist a link (it may stream fine), only authoritative
+ * rejections (401/403/404/410/5xx, error pages) do — and even those can be
+ * retried from the error card.
+ */
+
+import React, {
+  useMemo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useState,
+  useRef,
+} from "react";
+import {
+  View,
+  StyleSheet,
+  StatusBar,
+  Text,
+  TouchableOpacity,
+  AppState,
+  useWindowDimensions,
+} from "react-native";
+import { VideoView, useVideoPlayer, type VideoPlayer } from "expo-video";
+import { Ionicons } from "@expo/vector-icons";
+import * as ScreenOrientation from "expo-screen-orientation";
+import * as KeepAwake from "expo-keep-awake";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { colors } from "../theme/colors";
+import { ExpoVideoAdapter } from "./player/ExpoVideoAdapter";
+import { PlayerOverlay } from "./player/PlayerOverlay";
+import { StreamPickerSheet } from "./player/StreamPickerSheet";
+import { saveProgress } from "../lib/watchHistory";
+
+import {
+  rememberWorkingSource,
+  getLastWorkingSource,
+  forgetWorkingSource,
+  urlKeyOf,
+} from "../lib/lastWorkingSource";
+import { toPlayableUri } from "../lib/download/offlineUri";
+import { File } from "expo-file-system";
+import { getSubtitleChoice } from "../lib/subtitleCache";
+import { getAutoSyncPrefs } from "../lib/subtitlePrefs";
+import type { PlayerAdapter, AudioTrackInfo } from "./player/types";
+import type { StreamLink } from "./player/streamTypes";
+import {
+  validateStreamUrl,
+  invalidateValidation,
+  clearValidationCache,
+  type ProbeOutcome,
+  type ValidationResult,
+} from "../lib/streamValidator";
+import { getPlayerTuning, headersForUrl } from "../lib/playerConfig";
+import { useSettings } from "../lib/settings";
+import { clearPrefetchCache } from "../lib/streamPrefetch";
+import {
+  downloadAnimeSubtitle,
+  type AnimeSubtitleFile,
+} from "../lib/anime/subtitles";
+import { humanizeAudioLanguage } from "../lib/audioLanguage";
+import {
+  getActiveSkipSegment,
+  isSegmentUsable,
+  type IntroDbResponse,
+} from "../lib/introDetect";
+import {
+  PerfSessionTracker,
+  adoptPendingSession,
+  setActivePerfSession,
+  setPerfContext,
+} from "../lib/perfMetrics";
+import {
+  emitProviderSwitch,
+  trackBufferStall,
+  trackFeatureUsed,
+  trackPlayerError,
+  trackExitDuringSwitch,
+  trackWatchProgress,
+  getSessionId,
+} from "../lib/telemetry";
+const setPlayerStruggling = (struggling: boolean) => {
+  try {
+    const mod = require("expo-subtitle-sync");
+    mod?.setPlayerStruggling?.(struggling);
+  } catch {}
+};
+import {
+  stopWatchSession,
+  anchorWatchSession,
+  watchSessionStatus,
+  WATCH_SYNC_ENABLED,
+} from "../lib/subtitleSync/watchSync";
+import {
+  getSubtitleOffset,
+  setSubtitleOffset as persistSubtitleOffset,
+} from "../lib/subtitlePrefs";
+import {
+  detectContainer,
+  detectCodec,
+  getBufferProfile,
+} from "../lib/bufferProfiles";
+import {
+  parseLinkLanguages,
+  linkContainerLabel,
+  selectBestStream,
+  type PreferredLanguage,
+} from "../lib/streamSelector";
+import { bucketQuality } from "../lib/telemetry/types";
+
+interface HevcPlayerProps {
+  /** Direct video URL — used when playing a single source (Falix, local files). */
+  videoUrl?: string;
+  /** Multiple stream links from /api/player/direct (already ranked best-first). */
+  links?: StreamLink[];
+  /** Which link to auto-play (index into links array). Default: 0 */
+  defaultIndex?: number;
+  /** Probe outcomes from the stream cache — skips re-probing known URLs. */
+  prevalidatedResults?: Map<string, ValidationResult> | null;
+  tmdbId?: string;
+  mediaType?: "movie" | "tv";
+  season?: number;
+  episode?: number;
+  /** Anime session — progress is written to the anime-scoped history keys so
+   *  the title shows up in anime-mode Continue Watching, never movie/TV mode. */
+  isAnime?: boolean;
+  startAt?: number;
+  title?: string;
+  backdropUrl?: string;
+  /** Human-readable reason the default source was picked (shown in the picker). */
+  selectionReason?: string;
+  /** Index of the source that worked last time for this title (picker badge). */
+  lastWorkingIndex?: number;
+  /** User's preferred audio language — re-runs selection when changed mid-flow. */
+  preferredLanguage?: PreferredLanguage;
+  /** S1: registry display name for the active direct provider (e.g. "HDHub"). */
+  providerDisplayName?: string;
+  /** Embedded mode: report fullscreen transitions so the host container can
+   *  expand to true fullscreen. When provided, the host mirrors our state. */
+  onFullscreenChange?: (isFullscreen: boolean) => void;
+  /** Host-driven fullscreen (watch page overlay button) — mirrors it internally. */
+  externalFullscreen?: boolean;
+  /** Registers a getter the host can call to inspect/select HEVC sources
+   *  (powers the watch page's hub Sources tab without duplicating state). */
+  onRegisterSourceApi?: (
+    api: {
+      getLinks: () => StreamLink[];
+      getActiveIndex: () => number;
+      getStatuses: () => Record<number, ProbeOutcome>;
+      getRecommendedIndex: () => number;
+      getLastUsedIndex: () => number | undefined;
+      select: (index: number) => void;
+    } | null,
+  ) => void;
+  onClose: () => void;
+  /** Called when all direct links are exhausted. Host switches to next provider. */
+  onExhausted?: () => void;
+  /** Called when user taps "Try Another Server" in the error/exhausted card. */
+  onTryProvider?: () => void;
+  /** Intro/outro/recap segments for TV (host fetches via introdb) — enables
+   *  the Skip Intro/Recap button and the outro-window next-episode trigger. */
+  introSegments?: IntroDbResponse | null;
+  /** Next episode for TV — enables the Next-Episode card + auto-advance. */
+  nextEpisode?: { season: number; episode: number } | null;
+  /** Fired on next-episode tap / countdown end. Host refetches per-episode links. */
+  onNextEpisode?: (season: number, episode: number) => void;
+  /** D3: warm player created during details dwell — adopted instead of a cold open. */
+  externalPlayer?: VideoPlayer | null;
+  /** D3: cache key the external player was held under (for release-on-close). */
+  earlyPlayerKey?: string;
+  /** D3: URI the warm player was actually held with. When it differs from
+   *  videoSource (rank-time hold + walk advanced, or a late merge reordered
+   *  the pool), adoption syncs the source on the first URL-change pass. */
+  earlyPlayerUrl?: string;
+  /** Offline/local playback — mount straight into fullscreen landscape. */
+  startFullscreen?: boolean;
+  /** Source is a downloaded file: no chain to fall back through, no provider
+   *  hop — a failure is a bad file, and the card must say so. */
+  offline?: boolean;
+}
+
+interface SwitchInfo {
+  toIndex: number;
+  auto: boolean;
+}
+
+interface StreamErrorInfo {
+  title: string;
+  detail: string;
+}
+
+/** Error card for a downloaded file — there is no other source to hop to. */
+function offlineErrorInfo(reason: string): StreamErrorInfo {
+  return {
+    title: "Couldn't play the downloaded file",
+    detail: `${reason} The file may be incomplete or unsupported — re-download it from the Downloads tab.`,
+  };
+}
+
+// Switch/rebuffer limits live in lib/playerConfig (remote-tunable).
+/** Auto-advance countdown once the next-episode card arms at the end. */
+const NEXT_EPISODE_COUNTDOWN_S = 10;
+/** No outro data → arm the Next-Episode button this many seconds before the end. */
+const NEXT_EPISODE_ARM_BEFORE_END_S = 300;
+
+/**
+ * Pick the in-file audio track matching the language preference. Multi-audio
+ * MKVs default to their first track, which usually ignores the preference
+ * that picked the link — this closes that loop.
+ */
+function pickPreferredTrack(
+  tracks: AudioTrackInfo[],
+  pref: PreferredLanguage,
+): AudioTrackInfo | null {
+  if (!tracks || tracks.length === 0) return null;
+
+  const langOf = (t: AudioTrackInfo) =>
+    `${t.language ?? ""} ${t.label ?? ""}`.toLowerCase();
+  const has = (t: AudioTrackInfo, ...keys: string[]) =>
+    keys.some((k) => langOf(t).includes(k));
+
+  // Helper to check if audio codec looks supported (avoid DTS/TrueHD if AAC/AC3 track exists)
+  const isLossySupported = (t: AudioTrackInfo) => {
+    const l = langOf(t);
+    return !l.includes("dts") && !l.includes("truehd");
+  };
+
+  if (pref !== "auto" && pref !== "multi") {
+    // 1. Direct match with preference
+    const matched = tracks.filter((t) => has(t, pref));
+    if (matched.length > 0) {
+      // Prefer AAC / AC3 / standard codec over DTS/TrueHD to prevent silent audio
+      return matched.find(isLossySupported) ?? matched[0];
+    }
+  }
+
+  // 2. Default preference order: Hindi, Tamil, Telugu, English
+  const defaultOrder = ["hindi", "tamil", "telugu", "english"];
+  for (const lang of defaultOrder) {
+    const found = tracks.filter((t) => has(t, lang));
+    if (found.length > 0) {
+      return found.find(isLossySupported) ?? found[0];
+    }
+  }
+
+  // 3. Fall back to first supported lossy track, or track 0
+  return tracks.find(isLossySupported) ?? tracks[0];
+}
+
+/** Map raw adapter/probe errors to human language. */
+function humanizeError(raw: string): StreamErrorInfo {
+  const msg = (raw || "").toLowerCase();
+  if (msg.includes("403")) {
+    return {
+      title: "This source is refusing connections",
+      detail:
+        "The server returned 403 — the link is probably dead, expired, or region-locked. Try another source.",
+    };
+  }
+  if (msg.includes("404")) {
+    return {
+      title: "This file is gone",
+      detail:
+        "The server returned 404 — the file was removed from this host. Try another source.",
+    };
+  }
+  if (msg.includes("410") || msg.includes("410 gone")) {
+    return {
+      title: "This source expired",
+      detail: "The server says the file is gone (410). Try another source.",
+    };
+  }
+  if (msg.includes("does not support seeking")) {
+    return {
+      title: "This stream can't be seeked",
+      detail:
+        "Playback works, but seeking is broken on this server. Switching to a different source usually fixes it.",
+    };
+  }
+  if (
+    msg.includes("stalled") ||
+    msg.includes("timed out") ||
+    msg.includes("timeout")
+  ) {
+    return {
+      title: "This source is too slow",
+      detail:
+        "The server stopped responding while loading. Try another source or retry.",
+    };
+  }
+  if (msg.includes("extractor") || msg.includes("not supported")) {
+    return {
+      title: "This format isn't supported",
+      detail:
+        "The video codec in this file can't be decoded on this device. Try another source.",
+    };
+  }
+  if (msg.includes("network") || msg.includes("failed to connect")) {
+    return {
+      title: "Connection failed",
+      detail:
+        "Couldn't reach this server. Check your connection or try another source.",
+    };
+  }
+  return {
+    title: "Stream failed to load",
+    detail: raw || "An unknown error occurred.",
+  };
+}
+
+/**
+ * The index to actually start on: `defaultIndex`, unless the prevalidated
+ * probes condemn it — then the highest-ranked link that isn't condemned.
+ * `allDead` is true when every link was probed and every probe said dead:
+ * mounting any source would just burn the switch timeout before the embed
+ * handoff, so the caller skips direct playback entirely.
+ */
+function resolveStartIndex(
+  links: StreamLink[] | undefined,
+  defaultIndex: number,
+  prevalidated: Map<string, ValidationResult> | null,
+): { index: number; allDead: boolean } {
+  if (!links || links.length === 0 || !prevalidated || prevalidated.size === 0)
+    return { index: defaultIndex, allDead: false };
+  const outcomes = links.map((l) => prevalidated.get(l.url)?.outcome ?? null);
+  const fullyProbed = outcomes.every((o) => o != null);
+  const anyPlayable = outcomes.some((o) => o !== "dead");
+  if (fullyProbed && !anyPlayable)
+    return { index: defaultIndex, allDead: true };
+  if (outcomes[defaultIndex] !== "dead")
+    return { index: defaultIndex, allDead: false };
+  const firstNonDead = outcomes.findIndex((o) => o !== "dead");
+  return {
+    index: firstNonDead >= 0 ? firstNonDead : defaultIndex,
+    allDead: false,
+  };
+}
+
+export function HevcPlayer({
+  videoUrl,
+  links,
+  defaultIndex = 0,
+  prevalidatedResults,
+  tmdbId,
+  mediaType = "movie",
+  season,
+  episode,
+  startAt = 0,
+  title = "",
+  backdropUrl,
+  selectionReason,
+  lastWorkingIndex,
+  preferredLanguage = "auto",
+  providerDisplayName,
+  onFullscreenChange,
+  externalFullscreen,
+  onRegisterSourceApi,
+  onClose,
+  onExhausted,
+  onTryProvider,
+  introSegments,
+  nextEpisode,
+  onNextEpisode,
+  externalPlayer,
+  earlyPlayerKey,
+  earlyPlayerUrl,
+  isAnime,
+  startFullscreen = false,
+  offline = false,
+}: HevcPlayerProps) {
+  const { settings } = useSettings();
+  const screenFit = settings.playerScreenFit ?? "contain";
+  const [isFullscreen, setIsFullscreen] = useState(() => startFullscreen);
+  // Start index skips a probe-dead default (the probes already condemned it —
+  // playing it first is how "best badge on a failed URL" happened).
+  const [initialStart] = useState(() =>
+    resolveStartIndex(links, defaultIndex, prevalidatedResults ?? null),
+  );
+  const [activeLinkIndex, setActiveLinkIndex] = useState(initialStart.index);
+  const [showStreamPicker, setShowStreamPicker] = useState(false);
+  // Pre-mount the stream picker HIDDEN once links land (replaces FIX 6's
+  // defer-until-open): the first tap used to pay the sheet's mount + layout
+  // cost (~0.5–1s felt delay). The sheet gates its data work on `visible`,
+  // so a hidden pre-mount does no extra work and the opener is instant.
+  const [streamPickerMounted, setStreamPickerMounted] = useState(false);
+  useEffect(() => {
+    if (streamPickerMounted || !links || links.length === 0) return;
+    const t = setTimeout(() => setStreamPickerMounted(true), 1500);
+    return () => clearTimeout(t);
+  }, [links, streamPickerMounted]);
+  const openStreamPicker = useCallback(() => {
+    setStreamPickerMounted(true);
+    setShowStreamPicker(true);
+    trackFeatureUsed("quality_manual_override", "player", {
+      fromTab: "player_pill",
+      surface: "direct",
+    });
+  }, []);
+  /** Non-null while a source switch is in flight (auto-fallback or user pick). */
+  const [switchInfo, setSwitchInfo] = useState<SwitchInfo | null>(null);
+  const [streamError, setStreamError] = useState<StreamErrorInfo | null>(null);
+  const [exhausted, setExhausted] = useState(false);
+  /** Probe outcome per link index, for the picker UI and fallback ranking. */
+  const [linkStatuses, setLinkStatuses] = useState<
+    Record<number, ProbeOutcome>
+  >({});
+  /** True once the current source delivered actual frames — gates the
+   *  overlay's center controls so loading states are never covered. */
+  const [hasStarted, setHasStarted] = useState(false);
+  /** Position of the last periodic progress save (seconds). */
+  const lastSavedPositionRef = useRef(0);
+  /** startAt value the resume correction has been checked for. */
+  const resumeAppliedRef = useRef(-1);
+  /** P5 — resume correction fired this session (watch_end dim). */
+  const resumeCorrectedRef = useRef(false);
+
+  const adapterRef = useRef<PlayerAdapter | null>(null);
+  const failedLinksRef = useRef<Set<number>>(new Set());
+  const playbackFailedRef = useRef<Set<number>>(new Set());
+  const linkStatusesRef = useRef<Record<number, ProbeOutcome>>({});
+  const prevalidatedResultsRef = useRef<Map<string, ValidationResult> | null>(
+    null,
+  );
+  prevalidatedResultsRef.current = prevalidatedResults ?? null;
+  /** True while the current stream was explicitly chosen from the picker. */
+  const isManualSelectionRef = useRef(false);
+  /** Mirrors activeLinkIndex for use inside async callbacks. */
+  const activeIndexRef = useRef(activeLinkIndex);
+  activeIndexRef.current = activeLinkIndex;
+  /** Mirrors switchInfo for use inside async probe callbacks. */
+  const switchInfoRef = useRef<SwitchInfo | null>(null);
+  switchInfoRef.current = switchInfo;
+  /** True once the current source actually delivered playback — language
+   *  changes must never interrupt a healthy stream. */
+  const hasPlayedRef = useRef(false);
+  /** Chain head — what the picker's "Best" badge mirrors. It never points
+   *  somewhere other than what plays (or is about to play). */
+  const [selection, setSelection] = useState<{ index: number; reason: string }>(
+    {
+      index: initialStart.index,
+      reason: selectionReason ?? "",
+    },
+  );
+  /** URL of the source that is currently loaded — lets the links-refresh
+   *  migration find the playing source in a replaced ranking.
+   *  null until the first source is applied so the URL-change effect opens
+   *  the first PerfSession segment (E1). */
+  const currentSourceUrlRef = useRef<string | null>(null);
+  const segmentOpenedRef = useRef(false);
+  /** Set by the links-refresh migration so the index-change effect skips its
+   *  playback-state reset for the one remap pass (same URL, new index). */
+  const migrationRemapRef = useRef(false);
+  /** Exhaustion is fired exactly once per player lifetime — a late playback
+   *  error from an already-condemned source must not skip two embed
+   *  providers by re-triggering the handoff. */
+  const exhaustedRef = useRef(false);
+  /**
+   * @param autoProviderSwitch when false, exhaustion renders the exhausted
+   *   card but does NOT auto-call onExhausted (the provider hop). Cold-start
+   *   cascade guard (device 2026-09): when nothing has played yet this
+   *   episode, a fast error cascade over an unverified head on a slow
+   *   network burned through every provider in seconds. The user decides
+   *   via the card's "Try Another Server" instead; once something HAS
+   *   played, auto-hopping stays the existing behavior.
+   */
+  const fireExhausted = useCallback(
+    (autoProviderSwitch = true) => {
+      if (exhaustedRef.current) return;
+      exhaustedRef.current = true;
+      if (offline) {
+        console.log(
+          "[Flow] offline source failed — showing file error card (no chain to fall back through)",
+        );
+        setStreamError(offlineErrorInfo("Playback failed."));
+        return;
+      }
+      setExhausted(true);
+      perfRef.current?.noteFailed();
+      if (autoProviderSwitch) onExhausted?.();
+      else
+        console.log(
+          "[Flow] exhausted before any playback — showing recovery card, provider switch left to the user",
+        );
+    },
+    [onExhausted, offline],
+  );
+  const switchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const recheckTokenRef = useRef(0);
+  /** True while the app is backgrounded — freezes playback + auto-switching. */
+  const backgroundedRef = useRef(false);
+  /** When the app last returned to foreground — background-frozen timers
+   *  fire right after resume and must not condemn a source it never had
+   *  foreground time to load. */
+  const lastActiveAtRef = useRef(0);
+
+  // ── Auto audio-track selection ──
+  /** Set when the user picks a track manually — auto-select never overrides. */
+  const userAudioTouchedRef = useRef(false);
+  /** Link index the auto-select last applied for (once per source). */
+  const audioAutoAppliedRef = useRef(-1);
+
+  // ── Switch/aspect transparency toasts ──
+  const [autoToast, setAutoToast] = useState<string | null>(null);
+  const autoToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Set by an auto switch; consumed on first frames to show "Now playing…". */
+  const pendingAutoToastRef = useRef(false);
+
+  // ── Skip Intro / Next-Episode state ──
+  const [skipSegment, setSkipSegment] = useState<{
+    endSec: number;
+    label: string;
+  } | null>(null);
+  const skipSegmentLabelRef = useRef<string | null>(null);
+  const [nextUp, setNextUp] = useState(false);
+  const nextUpRef = useRef(false);
+  /** True once the countdown is ticking (starts at natural end of media). */
+  const [countdownActive, setCountdownActive] = useState(false);
+  const countdownActiveRef = useRef(false);
+  const [nextCountdown, setNextCountdown] = useState(NEXT_EPISODE_COUNTDOWN_S);
+  const nextCountdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(
+    null,
+  );
+  const autoNextCancelledRef = useRef(false);
+  /** Set once playback reached the natural end — gates all fallback paths. */
+  const endedRef = useRef(false);
+  /** Timestamps of recent mid-play stalls — sliding window for the watchdog. */
+  const rebufferTimesRef = useRef<number[]>([]);
+  /** Sources the user deliberately LEFT while they were still working
+   *  (ordered — most recent last). Auto-fallback skips them, respecting the
+   *  abandonment; when the whole chain has failed they are tried newest-first
+   *  as the "return to the last working source" rescue before the embed
+   *  handoff. */
+  const userLeftWorkingRef = useRef<number[]>([]);
+  /** Toast text override for the next auto-switch confirmation. */
+  const autoToastOverrideRef = useRef<string | null>(null);
+  /** Source index the slow-source toast last showed for (once per source). */
+  const slowToastShownForRef = useRef<number | null>(null);
+  /** Stable key of the remembered "last working source" for this title. */
+  const rememberedSourceKeyRef = useRef<string | null>(null);
+
+  // ── Tap→first-frame instrumentation ──
+  // FIX 9: adopt the details-started session when the key matches so
+  // intentTap → watchEntry → links → player → firstFrame share one clock.
+  const perfRef = useRef<PerfSessionTracker | null>(null);
+  if (!perfRef.current) {
+    const key = `${mediaType}:${tmdbId ?? "?"}${
+      season != null ? `:s${season}e${episode ?? ""}` : ""
+    }`;
+    perfRef.current = adoptPendingSession(key) ?? new PerfSessionTracker(key);
+    // FIX 1: hevcMounted marks first render; legacy "tap" is the fresh-session first mark.
+    perfRef.current.mark("hevcMounted");
+    setActivePerfSession(perfRef.current);
+  }
+  // [Q] pinpoint: which render pass is this, and when — a 2.9s render→effect
+  // gap means either many re-renders or one blocked render. Epoch correlates
+  // this line with every other [Q] line carrying t=.
+  const renderCountRef = useRef(0);
+  renderCountRef.current += 1;
+  if (renderCountRef.current <= 6) {
+    console.log(`[Q] render#${renderCountRef.current} t=${Date.now()}`);
+  }
+  /** Episode identity — a change here drops carried-over playback position. */
+  const lastEpKeyRef = useRef(`${season ?? ""}:${episode ?? ""}`);
+  /**
+   * Season/episode of the source actually PLAYING — progress saves must key
+   * off this, never the latest props. On next-episode the props flip BEFORE
+   * the refetched links arrive; a save in that window would write the old
+   * episode's near-end position under the new episode's key (the rare "next
+   * episode opens at its end" bug).
+   */
+  const playSeasonRef = useRef(season);
+  const playEpisodeRef = useRef(episode);
+
+  /** Subtitle sync offsets persist per series (not per episode). */
+  const subtitleKey = tmdbId ? `${mediaType}:${tmdbId}` : null;
+
+  /** Online-subtitle search context (Subdl, by TMDB id). */
+  const subtitleOnlineSearch = React.useMemo(
+    () =>
+      tmdbId
+        ? {
+            tmdbId: Number(tmdbId),
+            mediaType,
+            season: mediaType === "tv" ? season : undefined,
+            episode: mediaType === "tv" ? episode : undefined,
+          }
+        : undefined,
+    [tmdbId, mediaType, season, episode],
+  );
+
+  // Sidecar subtitles belong to one episode — drop them when the media changes.
+  // Source fallbacks within the same episode keep them (they re-merge per prepare).
+  /** JustAnime auto-attached sidecar key (reset per episode like the player's own). */
+  const attachedAnimeSubKeyRef = useRef("");
+  useEffect(() => {
+    adapterRef.current?.clearExternalSubtitles?.();
+    attachedAnimeSubKeyRef.current = "";
+  }, [mediaType, tmdbId, season, episode]);
+
+  // Auto-attach a cached online subtitle once playback starts (per episode).
+  // addExternalSubtitle re-prepares at the current position and selects the
+  // track when it appears — so a remembered choice just plays.
+  const cachedSubtitleKeyRef = useRef("");
+  /** Auto-attached online subtitle file — Auto Sync reads it when no sidecar is selected. */
+  const autoAttachedSubtitleRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!hasStarted || !subtitleOnlineSearch) return;
+    const key = `${subtitleOnlineSearch.mediaType}:${subtitleOnlineSearch.tmdbId}:${subtitleOnlineSearch.season ?? ""}:${subtitleOnlineSearch.episode ?? ""}`;
+    if (cachedSubtitleKeyRef.current === key) return;
+    cachedSubtitleKeyRef.current = key;
+    (async () => {
+      try {
+        const choice = await getSubtitleChoice(subtitleOnlineSearch);
+        if (!choice) return;
+        const file = new File(choice.uri);
+        if (!file.exists) return;
+        autoAttachedSubtitleRef.current = choice.uri;
+        await adapterRef.current?.addExternalSubtitle?.(
+          choice.uri,
+          choice.mimeType,
+          choice.language,
+          choice.label,
+        );
+      } catch {
+        // Auto-attach is best-effort — the sheet's online section remains.
+      }
+    })();
+  }, [hasStarted, subtitleOnlineSearch]);
+
+  // A REAL source change — user pick, chain fallback, or a sub↔dub toggle —
+  // re-prepares the native player, which DROPS every registered sidecar. Clear
+  // the once-guard so auto-attach re-adds for the new source. Index-only remaps
+  // (links-refresh migration) keep the same URL and must not touch it. Declared
+  // BEFORE the auto-attach effect so both run in the same commit, reset first.
+  useEffect(() => {
+    if (migrationRemapRef.current) return;
+    const url =
+      links && links.length > 0 ? (links[activeLinkIndex]?.url ?? null) : null;
+    if (
+      url &&
+      url !== currentSourceUrlRef.current &&
+      attachedAnimeSubKeyRef.current
+    ) {
+      attachedAnimeSubKeyRef.current = "";
+      console.log(
+        `[Anime][sub] source switched to ${url.slice(0, 44)} — once-guard reset`,
+      );
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [links, activeLinkIndex]);
+
+  // JustAnime: auto-attach the session's sidecar caption once playback starts
+  // (default captions ON, audio toggle proof). Downloaded to a local file
+  // because addExternalSubtitle can't send the vtt's Referer header. Every
+  // source switch / sub↔dub toggle re-prepares the native source and drops
+  // previously-registered sidecars — and upstream flags captions inconsistently
+  // (dub tracks ship WITHOUT the `default` flag). So prefer the default-flagged
+  // caption, else the first one when the source is a JustAnime link, else the
+  // first caption in the pool (animegg mp4s carry none of their own). It runs
+  // the candidate chain and waits for readyToPlay on slow mp4s so captions land
+  // on any server — all off the playback path, so attaching never blocks video.
+  useEffect(() => {
+    if (!hasStarted) return;
+    const link = links && links.length > 0 ? links[activeLinkIndex] : undefined;
+    if (!link) return;
+    const activeAudio = link._meta?.audio ?? "";
+    const isJustAnime = (l: StreamLink) =>
+      (l._meta?.source ?? "").includes("justanime");
+    const prefer = (l: StreamLink) => {
+      const subs = l._meta?.subtitles;
+      if (!subs || subs.length === 0) return undefined;
+      const def = subs.find((s) => s.default);
+      if (def) return def;
+      // Dub sidecars are unflagged — but movie sidecars (way2movies) are too,
+      // and must stay untouched. Only auto-pick the first for JustAnime.
+      return isJustAnime(l) ? subs[0] : undefined;
+    };
+    const ownDef = prefer(link);
+    // Candidate chain: the active source's caption first, then every pool
+    // caption in rank order, deduped by vtt URL. A dead vtt (403 / html error
+    // page) falls through to the next server's — captions apply no matter
+    // which server actually hosts them.
+    const candidates = new Map<
+      string,
+      { link: StreamLink; def: NonNullable<ReturnType<typeof prefer>> }
+    >();
+    if (ownDef) candidates.set(ownDef.url, { link, def: ownDef });
+    for (const l of links ?? []) {
+      const d = prefer(l);
+      if (d && !candidates.has(d.url)) {
+        candidates.set(d.url, { link: l, def: d });
+      }
+    }
+    if (candidates.size === 0) return;
+    const ordered = Array.from(candidates.values());
+    const key = `${link.url}|${activeAudio}|${ordered[0].def.url}`;
+    if (attachedAnimeSubKeyRef.current === key) return;
+    attachedAnimeSubKeyRef.current = key;
+    console.log(
+      `[Anime][sub] auto-attach → ${ordered[0].def.lang} (${ordered.length} candidate vtts)`,
+    );
+    (async () => {
+      const targetUrl = link.url;
+      // Downloads run off the playback path (each bounded to 10s) — captions
+      // never block video, which seeds from the first frame regardless.
+      let file: AnimeSubtitleFile | undefined;
+      let from: StreamLink | undefined;
+      for (const { link: cl, def: cd } of ordered) {
+        try {
+          const f = await downloadAnimeSubtitle(cd.url, cl.headers, cd.lang);
+          console.log(
+            `[Anime][sub] downloaded ${f.uri} from ${cl._meta?.source ?? "?"} (${cd.url.slice(0, 44)})`,
+          );
+          file = f;
+          from = cl;
+          break;
+        } catch (error) {
+          console.warn(
+            `[Anime][sub] download failed for ${cd.url.slice(0, 56)} (${cl._meta?.source ?? "?"}): ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+      }
+      if (!file || !from) {
+        console.warn(
+          `[Anime][sub] no downloadable caption in pool (${targetUrl.slice(0, 44)})`,
+        );
+        return;
+      }
+      if ((links?.[activeLinkIndex]?.url ?? null) !== targetUrl) {
+        console.log(
+          `[Anime][sub] attach superseded before attach — source changed (${targetUrl.slice(0, 44)})`,
+        );
+        return;
+      }
+      const uri = file.uri;
+      const mimeType = file.mimeType;
+      const language = file.language;
+      const label = file.label;
+      const srcLabel = from._meta?.source ?? "?";
+      const attemptOnce = async (): Promise<boolean> => {
+        const track = await adapterRef.current?.addExternalSubtitle?.(
+          uri,
+          mimeType,
+          language,
+          label,
+        );
+        if (track) {
+          autoAttachedSubtitleRef.current = uri;
+          console.log(
+            `[Anime][sub] attached ${uri} as track ${track} (source ${srcLabel})`,
+          );
+          return true;
+        }
+        return false;
+      };
+      if (await attemptOnce()) return;
+      // The merged sidecar child only exists once the main media is ready —
+      // slow mp4s (animegg) open in 10-60s, far past addExternalSubtitle's
+      // ~5s poll. Don't keep re-preparing (each one restarts the load):
+      // wait for readyToPlay, then either select the already-registered child
+      // directly (no re-prepare) or do one final re-add.
+      console.log(
+        `[Anime][sub] sidecar pending — waiting for readyToPlay (${targetUrl.slice(0, 44)})`,
+      );
+      const ready = await new Promise<boolean>((resolve) => {
+        let settled = false;
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        let off2: (() => void) | null = null;
+        const finish = (ok: boolean) => {
+          if (settled) return;
+          settled = true;
+          if (timer) clearTimeout(timer);
+          off2?.();
+          resolve(ok);
+        };
+        off2 =
+          adapterRef.current?.onStatusChange?.((status) => {
+            if (status === "readyToPlay") finish(true);
+          }) ?? null;
+        timer = setTimeout(
+          () => finish(false),
+          getPlayerTuning().switchTimeoutMs,
+        );
+      });
+      if (!ready) {
+        console.warn(
+          `[Anime][sub] attach unresolvable — ${targetUrl.slice(0, 44)} never became ready (${getPlayerTuning().switchTimeoutMs}ms)`,
+        );
+        return;
+      }
+      // The chain may have condemned this source while we waited.
+      if ((links?.[activeLinkIndex]?.url ?? null) !== targetUrl) {
+        console.log(
+          `[Anime][sub] attach superseded — source changed while waiting (${targetUrl.slice(0, 44)})`,
+        );
+        return;
+      }
+      // The first addExternalSubtitle may already have registered the child
+      // (its poll just gave up too early). Select it directly.
+      const existing = adapterRef.current
+        ?.getSubtitleTracks?.()
+        .find((t) => t.id.includes("sidecar"));
+      if (existing) {
+        adapterRef.current?.setSubtitleTrack?.(existing.id);
+        autoAttachedSubtitleRef.current = uri;
+        console.log(
+          `[Anime][sub] attached ${uri} as track ${existing.id} (recovered after readyToPlay)`,
+        );
+        return;
+      }
+      if (await attemptOnce()) return;
+      console.warn(
+        `[Anime][sub] attach unresolvable after readyToPlay: ${uri}`,
+      );
+    })();
+  }, [hasStarted, links, activeLinkIndex]);
+
+  const isMultiLink = !!links && links.length > 1;
+
+  // Resolve the current video URL from either links array or single URL
+  const activeUrl =
+    links && links.length > 0
+      ? (links[activeLinkIndex]?.url ?? links[0].url)
+      : (videoUrl ?? "");
+
+  const currentLink =
+    links && links.length > 0 ? links[activeLinkIndex] : undefined;
+
+  // Sidecar subtitles shipped with this pool, offered in the subtitle
+  // sheet's "With this source" section. MovieBox (PenguPlay) only — every
+  // other provider's sheet renders exactly as before. The active row is
+  // usually the dub (0 subtitle files) while the sub files live on sibling
+  // rows of the same pool, so gather the whole ranked pool — active row
+  // first — instead of just the active link. Rows of one source group ship
+  // the identical file set: dedupe by file url AND language label (the
+  // sheet keys its rows by url).
+  const subtitleSidecars = React.useMemo(() => {
+    if (!links?.length) return undefined;
+    const seenUrls = new Set<string>();
+    const seenLangs = new Set<string>();
+    const rows: { lang: string; url: string; source?: string }[] = [];
+    const ordered = currentLink
+      ? [currentLink, ...links.filter((l) => l !== currentLink)]
+      : links;
+    for (const l of ordered) {
+      const meta = l._meta;
+      if (meta?.providerId !== "moviebox" || !meta.subtitles?.length) continue;
+      for (const s of meta.subtitles) {
+        if (seenUrls.has(s.url) || seenLangs.has(s.lang)) continue;
+        seenUrls.add(s.url);
+        seenLangs.add(s.lang);
+        rows.push({
+          lang: s.lang,
+          url: s.url,
+          source: meta.source || undefined,
+        });
+      }
+    }
+    // English entries first ("English", "English - SDH", "English 2", "eng"…);
+    // everything else keeps its upstream/rank order (Array.sort is stable).
+    const isEnglish = (lang: string) => /^(english|eng)\b/i.test(lang.trim());
+    rows.sort((a, b) => Number(isEnglish(b.lang)) - Number(isEnglish(a.lang)));
+    return rows.length > 0 ? rows : undefined;
+  }, [links, currentLink]);
+
+  // Reset all tracking when media / links change
+  useEffect(() => {
+    // Diagnostic: what the source selector actually has, per audio track.
+    if (links && links.length > 0) {
+      let sub = 0;
+      let dub = 0;
+      let other = 0;
+      const firsts: string[] = [];
+      for (const l of links) {
+        const a = l._meta?.audio;
+        if (a === "sub") sub++;
+        else if (a === "dub") dub++;
+        else other++;
+        if (firsts.length < 6) firsts.push(`${a ?? "?"}:${l.quality ?? "?"}`);
+      }
+      console.log(
+        `[HevcPlayer] links → ${links.length} rows (sub=${sub} dub=${dub}${other ? ` other=${other}` : ""}) [${firsts.join(" | ")}]`,
+      );
+      console.log(
+        `[Q] player-array first3: ` +
+          links
+            .slice(0, 3)
+            .map(
+              (l, i) =>
+                `#${i} rawQ=${l.quality ?? "?"} size=${l._meta?.sizeBytes ?? 0} url=…${l.url.slice(-45)}`,
+            )
+            .join(" | "),
+      );
+      console.log(
+        `[Q] player-default idx=${defaultIndex} startIdx=${initialStart.index} rawQ=${links[defaultIndex]?.quality ?? "?"} url=${(links[defaultIndex]?.url ?? links[0]?.url ?? "").slice(0, 90)}`,
+      );
+    }
+    // A links refresh while something is already playing (racing prefetch vs
+    // watch-screen fetch produces a second ranking): if the playing source
+    // still exists in the new ranking, remap to it and keep playing — a
+    // ranking update must never yank live playback to a different source.
+    const playingUrl = currentSourceUrlRef.current;
+    if (hasPlayedRef.current && playingUrl) {
+      const migrated = links?.findIndex((l) => l.url === playingUrl) ?? -1;
+      if (migrated >= 0) {
+        console.log(
+          `[HevcPlayer] links refreshed — playing source still ranked #${migrated + 1}, keeping playback`,
+        );
+        setActiveLinkIndex(migrated);
+        // Index-keyed probe statuses are stale after remapping; the probe
+        // effect re-runs and the validator cache makes re-probing cheap.
+        linkStatusesRef.current = {};
+        setLinkStatuses({});
+        // The index-change effect must not reset playback state for this
+        // remap pass — it's the same URL, just a new position in the list.
+        migrationRemapRef.current = true;
+        return;
+      }
+    }
+
+    // New media (or the playing source vanished from the new ranking).
+    // If the probes condemned EVERY link, skip direct entirely — mounting a
+    // dead source just burns the switch timeout before the embed handoff.
+    // Never applies while something is already playing: playback is ground
+    // truth over a fresh probe sweep.
+    const start = resolveStartIndex(
+      links,
+      defaultIndex,
+      prevalidatedResultsRef.current,
+    );
+    if (start.allDead && !hasPlayedRef.current) {
+      console.log(
+        "[HevcPlayer] every link probe-dead — skipping direct, handing off to embed",
+      );
+      fireExhausted();
+      return;
+    }
+
+    isManualSelectionRef.current = false;
+    failedLinksRef.current.clear();
+    playbackFailedRef.current.clear();
+    userLeftWorkingRef.current = [];
+    linkStatusesRef.current = {};
+    hasPlayedRef.current = false;
+    rebufferTimesRef.current = [];
+    slowToastShownForRef.current = null;
+    autoToastOverrideRef.current = null;
+    currentSourceUrlRef.current = links?.[start.index]?.url ?? null;
+    setHasStarted(false);
+    setLinkStatuses({});
+    exhaustedRef.current = false;
+    setExhausted(false);
+    setStreamError(null);
+    setSelection({ index: start.index, reason: selectionReason ?? "" });
+    setActiveLinkIndex(start.index);
+    // Episode identity change (not a mere source switch) — drop the carried-
+    // over position so the new episode doesn't open at the old one's timestamp.
+    const epKey = `${season ?? ""}:${episode ?? ""}`;
+    if (lastEpKeyRef.current !== epKey) {
+      lastEpKeyRef.current = epKey;
+      playSeasonRef.current = season;
+      playEpisodeRef.current = episode;
+      lastPlaybackTimeRef.current = 0;
+      resumeAppliedRef.current = -1;
+    }
+    // Reset per-episode/per-source UI state
+    autoNextCancelledRef.current = false;
+    nextUpRef.current = false;
+    endedRef.current = false;
+    countdownActiveRef.current = false;
+    setNextUp(false);
+    setCountdownActive(false);
+    audioAutoAppliedRef.current = -1;
+    skipSegmentLabelRef.current = null;
+    setSkipSegment(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [links, defaultIndex]);
+
+  const setLinkOutcome = useCallback((idx: number, outcome: ProbeOutcome) => {
+    linkStatusesRef.current = { ...linkStatusesRef.current, [idx]: outcome };
+    setLinkStatuses(linkStatusesRef.current);
+    if (outcome === "dead") {
+      failedLinksRef.current.add(idx);
+    } else if (outcome === "valid") {
+      failedLinksRef.current.delete(idx);
+      playbackFailedRef.current.delete(idx);
+    }
+  }, []);
+
+  /**
+   * Pick the next fallback candidate. Two passes over the (already
+   * recommendation-ranked) links array: first probe-verified links, then
+   * anything not marked dead. Sources the user deliberately left while
+   * working are skipped — the chain only returns to them via the rescue.
+   * Returns null when everything is exhausted.
+   */
+  const pickFallbackCandidate = useCallback(
+    (failedIndex: number): number | null => {
+      if (!links) return null;
+      const n = links.length;
+      const isUsable = (i: number) =>
+        i !== failedIndex &&
+        !failedLinksRef.current.has(i) &&
+        !playbackFailedRef.current.has(i) &&
+        !userLeftWorkingRef.current.includes(i);
+
+      // After content has been playing, only fall back to a lighter-or-equal
+      // stream — never upgrade to a bigger file mid-playback.
+      const currentSize = hasPlayedRef.current
+        ? ((links[activeIndexRef.current]?._meta?.sizeBytes as
+            | number
+            | undefined) ?? 0)
+        : 0;
+      const withinSizeCap = (i: number) =>
+        !hasPlayedRef.current ||
+        currentSize === 0 || // unknown current size — allow anything
+        // Known size, and not bigger than what was playing. Unknown-size
+        // candidates are skipped: "not bigger" can't be verified, and the
+        // gamble once pulled a huge file into a mid-playback fallback.
+        (((links[i]?._meta?.sizeBytes as number | undefined) ?? 0) > 0 &&
+          ((links[i]?._meta?.sizeBytes as number | undefined) ?? 0) <=
+            currentSize);
+
+      for (let i = 0; i < n; i++) {
+        if (
+          isUsable(i) &&
+          withinSizeCap(i) &&
+          linkStatusesRef.current[i] === "valid"
+        )
+          return i;
+      }
+      for (let i = 0; i < n; i++) {
+        if (isUsable(i) && withinSizeCap(i)) return i;
+      }
+      return null;
+    },
+    [links],
+  );
+
+  /**
+   * Last-resort rescue: the most recent source the user left while it was
+   * still working — "when all priority fails, play the last working one".
+   * Consumes the entry so a failing rescue can't loop; entries that failed
+   * since are skipped.
+   */
+  const takeLastReserve = useCallback((): number | null => {
+    while (userLeftWorkingRef.current.length > 0) {
+      const candidate = userLeftWorkingRef.current.pop()!;
+      if (
+        !failedLinksRef.current.has(candidate) &&
+        !playbackFailedRef.current.has(candidate)
+      ) {
+        return candidate;
+      }
+    }
+    return null;
+  }, []);
+
+  /**
+   * A remembered "last working source" that fails again is a poisoned entry
+   * (e.g. a dead link once falsely marked as playing) — forget it so the next
+   * watch doesn't auto-promote it. Declared before beginSwitch/fallback since
+   * both failure paths call it.
+   */
+  const forgetIfRemembered = useCallback(
+    (url?: string) => {
+      if (!url || !tmdbId || !rememberedSourceKeyRef.current) return;
+      if (urlKeyOf(url) === rememberedSourceKeyRef.current) {
+        rememberedSourceKeyRef.current = null;
+        forgetWorkingSource(mediaType, tmdbId).catch(() => {});
+        console.log(
+          "[HevcPlayer] Remembered source failed again — forgetting it",
+        );
+      }
+    },
+    [mediaType, tmdbId],
+  );
+
+  const beginSwitch = useCallback(
+    (
+      toIndex: number,
+      auto: boolean,
+      toastText?: string,
+      reason: "timeout" | "error" | "dead" | "user" | "switch" = "switch",
+    ) => {
+      // Phase 4 T2 — provider_switch (before index mutates so from/to are real).
+      {
+        const fromProvider =
+          links?.[activeIndexRef.current]?._meta?.providerId ?? "unknown";
+        const toProvider = links?.[toIndex]?._meta?.providerId ?? fromProvider;
+        emitProviderSwitch(fromProvider, toProvider, reason);
+      }
+      setActiveLinkIndex(toIndex);
+      autoToastOverrideRef.current = toastText ?? null;
+      setSwitchInfo({ toIndex, auto });
+      // The badge mirrors the chain head — what plays (or is about to play)
+      // IS the recommendation, whether the chain chose it or the user did.
+      setSelection((prev) =>
+        prev.index === toIndex ? prev : { index: toIndex, reason: prev.reason },
+      );
+      // E1: stamp why the OUTGOING source is ending on its open segment.
+      // Auto switches also bump fallbackCount.
+      perfRef.current?.noteSourceSegmentEnd(reason);
+      if (auto) {
+        pendingAutoToastRef.current = true;
+        perfRef.current?.noteFallback();
+      }
+      // Fresh stall window for the incoming source.
+      rebufferTimesRef.current = [];
+      slowToastShownForRef.current = null;
+      if (switchTimeoutRef.current) clearTimeout(switchTimeoutRef.current);
+      // Safety net: if nothing plays after the switch timeout, surface the error
+      // instead of spinning forever on a source that will never open.
+      switchTimeoutRef.current = setTimeout(function switchTimeout() {
+        // Playback is frozen while backgrounded — a source must not be
+        // condemned (or swapped, which would play() the new one) while the
+        // user is away. Background-frozen timers fire right after resume
+        // (after "active" already cleared the flag), so also defer briefly
+        // on a fresh return.
+        if (
+          backgroundedRef.current ||
+          Date.now() - lastActiveAtRef.current < 1500
+        ) {
+          switchTimeoutRef.current = setTimeout(switchTimeout, 2000);
+          return;
+        }
+        const idx = activeIndexRef.current;
+        console.log(
+          `[Flow] switch timeout: source #${idx} never played in time — condemning, chain takes over`,
+        );
+        failedLinksRef.current.add(idx);
+        playbackFailedRef.current.add(idx);
+        forgetIfRemembered(links?.[idx]?.url);
+        // The manual contract ended with the source — the chain takes over.
+        isManualSelectionRef.current = false;
+        const next = pickFallbackCandidate(idx);
+        if (next === null) {
+          const rescue = takeLastReserve();
+          if (rescue !== null) {
+            console.log(
+              `[Flow] chain exhausted — returning to last working source #${rescue}`,
+            );
+            beginSwitch(
+              rescue,
+              true,
+              `Returning to source ${rescue + 1}`,
+              "timeout",
+            );
+          } else {
+            setSwitchInfo(null);
+            // Switch-timeout exhaustion: nothing played (else the timeout
+            // would not have fired). On a cold network this is the cascade
+            // killer — a slow-but-alive source condemned here used to burn
+            // the next provider too. Show the recovery card; the user hops.
+            fireExhausted(hasPlayedRef.current);
+          }
+        } else {
+          beginSwitch(next, true, undefined, "timeout");
+        }
+      }, getPlayerTuning().switchTimeoutMs);
+    },
+    [pickFallbackCandidate, takeLastReserve, forgetIfRemembered, links],
+  );
+
+  function fallbackToNextLink(failedIndex: number, reason: string) {
+    failedLinksRef.current.add(failedIndex);
+    playbackFailedRef.current.add(failedIndex);
+    // The manual contract ended with the source — the chain takes over
+    // (skipping sources the user left working; last-working rescue before
+    // the embed handoff).
+    isManualSelectionRef.current = false;
+
+    const numLinks = links?.length ?? 0;
+    if (numLinks <= 1) {
+      setSwitchInfo(null);
+      // Same cold-start rule as the multi-link path below: nothing played
+      // yet → the user chooses (Re-check / Try Another Server); something
+      // played → auto provider hop stays.
+      fireExhausted(hasPlayedRef.current);
+      return;
+    }
+
+    const next = pickFallbackCandidate(failedIndex);
+    if (next === null) {
+      const rescue = takeLastReserve();
+      if (rescue !== null) {
+        console.log(
+          `[HevcPlayer] chain exhausted (${reason}) — returning to last working source ${rescue}`,
+        );
+        beginSwitch(
+          rescue,
+          true,
+          `Returning to source ${rescue + 1}`,
+          reason === "error" || reason === "repeated-stalls" ? "error" : "dead",
+        );
+        return;
+      }
+      console.log(
+        `[Flow] all ${numLinks} links exhausted after ${reason} failure — embed handoff`,
+      );
+      setSwitchInfo(null);
+      // Error-failure exhaustion with no playback this episode is the
+      // classic cold-start cascade (unverified head + slow probes): hold the
+      // provider and show Re-check / Choose / Try Another Server instead of
+      // auto-hopping. Once something has played, keep the auto handoff.
+      fireExhausted(hasPlayedRef.current);
+      return;
+    }
+
+    console.log(`[Flow] fallback (${reason}): #${failedIndex} → #${next}`);
+    // A repeatedly-stalling source still plays — only hard failures (error,
+    // switch timeout, probe-dead) should un-remember it.
+    if (reason !== "repeated-stalls") {
+      forgetIfRemembered(links?.[failedIndex]?.url);
+    }
+    beginSwitch(
+      next,
+      true,
+      undefined,
+      reason === "error" || reason === "repeated-stalls" ? "error" : "dead",
+    );
+  }
+
+  // Load the remembered source key for this title (for forget-on-failure).
+  useEffect(() => {
+    if (!tmdbId) return;
+    let cancelled = false;
+    getLastWorkingSource(mediaType, tmdbId)
+      .then((key) => {
+        if (!cancelled) rememberedSourceKeyRef.current = key;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [mediaType, tmdbId]);
+
+  // ── Probe outcomes: the active source first, the rest after playback ──
+  // The pipeline already probed the chain head BEFORE mount — playback never
+  // waits on any other link. Probing the remaining sources while the head is
+  // trying to deliver its first frames would steal its bandwidth, so the
+  // bulk probing starts only once frames are flowing (second effect below).
+  const [recheckToken, setRecheckToken] = useState(0);
+  useEffect(() => {
+    if (!links || links.length <= 1) return;
+    let cancelled = false;
+    // Pending counts only probes started HERE (the active source). Cached
+    // pipeline verdicts apply instantly and need no probe.
+    let pending = 0;
+
+    // Once the active source's probe has settled: if it's confirmed dead and
+    // nothing is playing, jump ONCE to the best remaining candidate — or admit
+    // exhaustion. A single clean switch instead of hopping through dead links.
+    const resolveAfterProbes = () => {
+      if (cancelled || pending > 0) return;
+      const activeIdx = activeIndexRef.current;
+      if (hasPlayedRef.current) return;
+      if (linkStatusesRef.current[activeIdx] !== "dead") return;
+      if (isManualSelectionRef.current) return; // error card already shown
+      const next = pickFallbackCandidate(activeIdx);
+      if (next === null) {
+        const rescue = takeLastReserve();
+        if (rescue !== null) {
+          console.log(
+            `[Flow] probes exhausted — returning to last working source #${rescue}`,
+          );
+          beginSwitch(
+            rescue,
+            true,
+            `Returning to source ${rescue + 1}`,
+            "dead",
+          );
+        } else {
+          console.log(`[Flow] all ${links.length} probes dead — embed handoff`);
+          setSwitchInfo(null);
+          fireExhausted();
+        }
+      } else {
+        console.log(
+          `[Flow] active link #${activeIdx} probe-dead — jumping to candidate #${next}`,
+        );
+        beginSwitch(next, true, undefined, "dead");
+      }
+    };
+
+    const applyOutcome = (idx: number, result: ValidationResult) => {
+      if (cancelled) return;
+      setLinkOutcome(idx, result.outcome);
+
+      // A remembered source the probes condemn — and that isn't actually
+      // playing — is a poisoned entry; forget it.
+      if (
+        result.outcome === "dead" &&
+        (!hasPlayedRef.current || idx !== activeIndexRef.current)
+      ) {
+        forgetIfRemembered(links?.[idx]?.url);
+      }
+
+      if (idx === activeIndexRef.current && result.outcome === "dead") {
+        console.log(
+          `[Flow] active link #${idx} is dead (${result.statusCode || result.error})`,
+        );
+        if (hasPlayedRef.current) {
+          // The link is actually delivering frames — the probe verdict is
+          // wrong (edge rules, hotlink quirks). Playback is ground truth:
+          // heal the status and keep watching.
+          console.log(
+            `[Flow] link #${idx} is playing — probe verdict wrong, healing`,
+          );
+          failedLinksRef.current.delete(idx);
+          linkStatusesRef.current = {
+            ...linkStatusesRef.current,
+            [idx]: "valid",
+          };
+          setLinkStatuses(linkStatusesRef.current);
+        } else if (isManualSelectionRef.current) {
+          // A manually-picked source the probes condemn before it ever
+          // played has ended its contract — the chain takes over (the
+          // switch timeout / resolveAfterProbes pick the next candidate).
+          isManualSelectionRef.current = false;
+        }
+        // Otherwise hold position — resolveAfterProbes switches straight to
+        // the next candidate as soon as this probe settles.
+        return;
+      }
+
+      // Promote a verified link over a dead/failed active link. Deliberately
+      // NOT over a merely-untested active link — the old behavior stole
+      // playback from links that were loading perfectly fine.
+      // Also never promote while content is actually playing — playback is
+      // ground truth over probe verdicts (CDN hiccups mislead probes).
+      if (
+        result.outcome === "valid" &&
+        idx !== activeIndexRef.current &&
+        !isManualSelectionRef.current &&
+        switchInfoRef.current === null &&
+        !hasPlayedRef.current
+      ) {
+        const activeOutcome = linkStatusesRef.current[activeIndexRef.current];
+        if (
+          activeOutcome === "dead" ||
+          (playbackFailedRef.current.has(activeIndexRef.current) &&
+            activeOutcome !== "valid")
+        ) {
+          console.log(
+            `[Flow] promoting verified link #${idx} over failed link #${activeLinkIndex}`,
+          );
+          beginSwitch(idx, true, undefined, "dead");
+        }
+      }
+    };
+
+    // Pipeline verdicts apply instantly — free, no network.
+    links.forEach((link, idx) => {
+      const cached = prevalidatedResultsRef.current?.get(link.url);
+      if (cached) applyOutcome(idx, cached);
+    });
+    resolveAfterProbes();
+
+    // The active source is probed NOW: if it's dead we must know pre-play.
+    const activeLink = links[activeIndexRef.current];
+    if (activeLink && !prevalidatedResultsRef.current?.get(activeLink.url)) {
+      pending++;
+      validateStreamUrl(activeLink.url, activeLink.headers)
+        .then((result) => {
+          pending--;
+          applyOutcome(activeIndexRef.current, result);
+          resolveAfterProbes();
+        })
+        .catch(() => {
+          // transient probe error — outcome stays unrecorded
+          pending--;
+          resolveAfterProbes();
+        });
+    }
+
+    return () => {
+      cancelled = true;
+    };
+    // switchInfo intentionally excluded — applyOutcome reads latest via refs
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    links,
+    activeLinkIndex,
+    recheckToken,
+    setLinkOutcome,
+    beginSwitch,
+    takeLastReserve,
+    forgetIfRemembered,
+  ]);
+
+  // ── Background probing of the remaining sources ──
+  // Starts on FIRST FRAMES, never before: pre-play probe traffic contends
+  // with the head source's startup, and the "verified" counter ticking up in
+  // the loading spinner read like a playback gate. Outcomes feed the picker
+  // and give the fallback chain verified candidates.
+  useEffect(() => {
+    if (!hasStarted || !links || links.length <= 1) return;
+    let cancelled = false;
+    const todo: Array<{ url: string; idx: number }> = [];
+    links.forEach((link, idx) => {
+      if (linkStatusesRef.current[idx] === undefined)
+        todo.push({ url: link.url, idx });
+    });
+
+    let cursor = 0;
+    const PROBE_CONCURRENCY = 4;
+    const runNext = (): Promise<void> => {
+      if (cursor >= todo.length) return Promise.resolve();
+      const { url, idx } = todo[cursor++];
+      return validateStreamUrl(url, links[idx]?.headers)
+        .then((result) => {
+          if (cancelled) return;
+          setLinkOutcome(idx, result.outcome);
+          // A remembered source the background probes condemn (and that
+          // isn't the one playing) is poisoned — forget it.
+          if (result.outcome === "dead" && idx !== activeIndexRef.current) {
+            forgetIfRemembered(url);
+          }
+        })
+        .catch(() => {})
+        .then(runNext);
+    };
+    for (let i = 0; i < PROBE_CONCURRENCY; i++) void runNext();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [hasStarted, links, recheckToken, setLinkOutcome, forgetIfRemembered]);
+
+  // Construct VideoSource with per-host headers (lib/playerConfig) and
+  // per-link headers (adapter-set, e.g. hakunaymatata Referer).
+  const videoSource = useMemo(() => {
+    const linkType = (currentLink?.type || "").toLowerCase();
+    const contentType =
+      linkType === "m3u8" || linkType === "hls"
+        ? ("hls" as const)
+        : linkType === "mpd" || linkType === "dash"
+          ? ("dash" as const)
+          : ("auto" as const);
+    return {
+      uri: toPlayableUri(activeUrl),
+      headers: { ...headersForUrl(activeUrl), ...(currentLink?.headers ?? {}) },
+      ...(contentType !== "auto" ? { contentType } : {}),
+    };
+  }, [activeUrl, currentLink?.headers, currentLink?.type]);
+  // [Bar] a URI change recreates the hook player (keyed on the stringified
+  // source) — the trigger for the "bar reset while loading" report.
+  useEffect(() => {
+    console.log(`[Bar] videoSource → ${videoSource.uri.slice(0, 90)}`);
+  }, [videoSource.uri]);
+
+  // Detect container & codec from current link for buffer tuning + badges
+  const container = detectContainer(currentLink?.name ?? "", activeUrl);
+  const codec = detectCodec(
+    currentLink?.name ?? "",
+    activeUrl,
+    currentLink?._meta,
+  );
+  const bufferProfile = getBufferProfile(container, codec);
+  // [watchperf] FIX 5 — codec/container + provider for the close() summary.
+  useEffect(() => {
+    setPerfContext({
+      codec,
+      container,
+      provider: currentLink?._meta?.providerId ?? providerDisplayName,
+    });
+  }, [codec, container, currentLink?._meta?.providerId, providerDisplayName]);
+
+  // Latest stream facts for subtitle Auto Sync — read at button-press time so
+  // a source switch mid-run resolves to the current URL, never a stale one.
+  const autoSyncSourceRef = useRef({
+    uri: activeUrl,
+    headers: {} as Record<string, string>,
+    container,
+  });
+  autoSyncSourceRef.current = {
+    uri: activeUrl,
+    headers: videoSource.headers,
+    container,
+  };
+
+  // Track continuous playback position across source switches and seeking
+  const lastPlaybackTimeRef = useRef(startAt);
+  /** [Flow] diagnostic — epoch when the current source was applied. */
+  const sourceSetAtRef = useRef(0);
+  // Watch progress threshold tracking — fires at 25/50/75/100% crossings.
+  const watchedThresholdsRef = useRef<Set<number>>(new Set());
+  // Episode identity the applied source belongs to. The setup factory below
+  // runs DURING render (useVideoPlayer → useReleasingSharedObject useMemo),
+  // before the links effect resets lastPlaybackTimeRef — so the carry read
+  // must be keyed or a cross-episode switch seeks to the old episode's time.
+  const sourceEpKeyRef = useRef(`${season ?? ""}:${episode ?? ""}`);
+
+  // [Q] pinpoint: split sourceSet (render/factory) → commit → passive-flush.
+  // A layout effect runs synchronously at commit (before paint); the paired
+  // passive effect runs after paint. The gap between them = JS thread busy /
+  // React scheduling; commit−sourceSet = remaining render phase.
+  useLayoutEffect(() => {
+    console.log(
+      `[Q] commit sinceSourceSet=${
+        sourceSetAtRef.current ? Date.now() - sourceSetAtRef.current : "n/a"
+      }ms t=${Date.now()}`,
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  useEffect(() => {
+    console.log(
+      `[Q] passive sinceSourceSet=${
+        sourceSetAtRef.current ? Date.now() - sourceSetAtRef.current : "n/a"
+      }ms t=${Date.now()}`,
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Create video player — immediate (no gating). D3: when details held a warm
+  // player for this key, ADOPT it (hookPlayer is still constructed so hook
+  // order stays stable; the external instance is what VideoView/adapter drive).
+  // CRITICAL: when adopting, construct the hook player with a NULL source.
+  // A real-source hook player begins its native load at construction (pause()
+  // does NOT stop it), so adoption used to spawn TWO concurrent HEVC decoders
+  // on the same stream — that starved the JS thread for ~38s and pushed
+  // decode to 41s on the emulator. Null source = idle hook player, no second
+  // decoder. The player is keyed on the stringified source, so if externalPlayer
+  // ever flips the hook player is recreated (old one released by the hook).
+  const hookSource = externalPlayer ? null : videoSource;
+  const hookPlayer = useVideoPlayer(hookSource, (playerInstance) => {
+    // Adopted early player drives playback — this idle instance must never
+    // play (double audio) or touch the real source. sourceSet/playerOpen are
+    // marked by the adoption effect instead.
+    if (externalPlayer) {
+      try {
+        playerInstance.pause();
+      } catch {}
+      return;
+    }
+    console.log(
+      `[Flow] player: opening #${activeIndexRef.current} ${currentLink?.quality ?? "?"} ${activeUrl.slice(0, 60)} (container=${container}, codec=${codec}) wrapped=${videoSource.uri.slice(0, 80)} offline=${offline}`,
+    );
+    console.log(
+      `[Q] player-open idx=${activeIndexRef.current} rawQ=${currentLink?.quality ?? "?"} size=${currentLink?._meta?.sizeBytes ?? 0} name=${JSON.stringify((currentLink?.name ?? "").slice(0, 80))} url=${activeUrl.slice(0, 90)} t=${Date.now()}`,
+    );
+    // [watchperf] FIX 2 — sourceSet: URL applied to the video player instance.
+    perfRef.current?.mark("sourceSet", {
+      container,
+      codec,
+      provider: currentLink?._meta?.providerId,
+    });
+    sourceSetAtRef.current = Date.now();
+    playerInstance.loop = false;
+    playerInstance.timeUpdateEventInterval = 0.25;
+    // Native default is FALSE (despite docs saying true) — without this,
+    // 2x speed pitches the audio up (chipmunk effect) on Android.
+    playerInstance.preservesPitch = true;
+    playerInstance.volume = 1.0;
+    playerInstance.muted = false;
+    playerInstance.seekTolerance = { toleranceBefore: 5, toleranceAfter: 5 };
+    playerInstance.scrubbingModeOptions = {
+      increaseCodecOperatingRate: true,
+      enableDynamicScheduling: true,
+      useDecodeOnlyFlag: true,
+      allowSkippingMediaCodecFlush: true,
+    };
+    playerInstance.bufferOptions = bufferProfile;
+    const factoryEpKey = `${season ?? ""}:${episode ?? ""}`;
+    const initialTime =
+      sourceEpKeyRef.current === factoryEpKey && lastPlaybackTimeRef.current > 0
+        ? lastPlaybackTimeRef.current
+        : startAt;
+    sourceEpKeyRef.current = factoryEpKey;
+    if (initialTime > 0) {
+      playerInstance.currentTime = initialTime;
+    }
+    // Reaching here means externalPlayer was null at construction (the adopt
+    // case early-returns above) — this is the sole playback player.
+    playerInstance.play();
+  });
+
+  const adoptedExternalRef = useRef(false);
+  const lastExternalUriRef = useRef<string | null>(null);
+  const player = externalPlayer ?? hookPlayer;
+
+  // D3: mark adoption on first external mount — sourceSet reflects reality
+  // (the warm player already applied the head URL during details dwell).
+  useEffect(() => {
+    if (!externalPlayer || adoptedExternalRef.current) return;
+    adoptedExternalRef.current = true;
+    perfRef.current?.mark("sourceSet", {
+      container,
+      codec,
+      provider: currentLink?._meta?.providerId,
+      via: "early-adopt",
+    });
+    sourceSetAtRef.current = Date.now();
+    // The warm player may already be readyToPlay — surface that immediately
+    // instead of waiting for a fresh statusChange we may never receive.
+    try {
+      const status = (externalPlayer as { status?: string }).status;
+      if (status === "readyToPlay" || status === "loading") {
+        perfRef.current?.mark("playerReady", {
+          status,
+          via: "early-adopt",
+        });
+      }
+    } catch {}
+    console.log(
+      `[Flow] player: adopted early player (key=${earlyPlayerKey ?? "?"})`,
+    );
+    // The unused hook player must not also play — two live players = double audio.
+    try {
+      hookPlayer.pause();
+    } catch {}
+    // Hold no longer auto-plays (no VideoView on details) — start on adopt.
+    try {
+      externalPlayer.play();
+    } catch {}
+    // E1: segment open is owned by the URL-change effect (first pass included).
+    // Seed with the URI the held player ACTUALLY has — when it differs from
+    // videoSource (rank-time hold, then the walk advanced or a late merge
+    // reordered), the URL-change effect below replaces on this first pass.
+    lastExternalUriRef.current = earlyPlayerUrl ?? videoSource?.uri ?? null;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [externalPlayer]);
+
+  // E1: when videoSource changes while an adopted (D3) player is active,
+  // the hookPlayer recreation is a no-op — the adopted instance never sees
+  // the new URL. Sync it via replaceAsync so source switches actually play.
+  useEffect(() => {
+    if (!externalPlayer || !adoptedExternalRef.current) return;
+    const uri = videoSource?.uri ?? null;
+    if (!uri || uri === lastExternalUriRef.current) return;
+    lastExternalUriRef.current = uri;
+    externalPlayer
+      .replaceAsync(videoSource)
+      .then(() => {
+        // replace() does not re-apply our position logic. The links effect
+        // (declared earlier) has already reset lastPlaybackTimeRef on a
+        // cross-episode switch, so this lands on the gated seed or 0; a
+        // same-episode source switch keeps its carried position.
+        const t =
+          lastPlaybackTimeRef.current > 0
+            ? lastPlaybackTimeRef.current
+            : startAt;
+        if (t > 0) externalPlayer.currentTime = t;
+      })
+      .catch((e) => {
+        console.log(`[HevcPlayer] early-player replaceAsync failed: ${e}`);
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videoSource, externalPlayer]);
+
+  // D3: the adopted warm player is OWNED by the watch screen (single-owner
+  // rule — see earlyPlayerHolder). This component must NEVER release it:
+  // React runs the old mount's cleanup BEFORE the new mount's effects, so
+  // any borrower-side release races the next borrower's VideoView — that
+  // is exactly the "Cannot use shared object that was already released"
+  // crash when HevcPlayer double-mounts for one key. Cleanup only pauses
+  // so an unmounted instance stays silent (the new instance's adopt effect
+  // re-plays); the screen disposes the player on unmount.
+  useEffect(() => {
+    if (!externalPlayer) return;
+    return () => {
+      try {
+        externalPlayer.pause();
+      } catch {}
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [externalPlayer]);
+
+  // Wrap in adapter (stable — only recreated if player changes)
+  const adapter = useMemo(() => new ExpoVideoAdapter(player), [player]);
+  adapterRef.current = adapter;
+
+  // [watchperf] FIX 2 — playerReady: first expo-video statusChange → readyToPlay.
+  useEffect(() => {
+    if (!adapter.onStatusChange) return;
+    return adapter.onStatusChange((status) => {
+      const sinceSrc = sourceSetAtRef.current
+        ? Date.now() - sourceSetAtRef.current
+        : -1;
+      console.log(
+        `[Flow] player: status=${status} (+${sinceSrc}ms since sourceSet)`,
+      );
+      if (status === "readyToPlay") {
+        perfRef.current?.mark("playerReady", { status });
+      }
+    });
+  }, [adapter]);
+
+  // Pause when the app is backgrounded — video and audio must stop. JS event
+  // callbacks keep firing while backgrounded but JS timers do NOT (RN freezes
+  // the Timing module), so the adapter itself squashes native playing
+  // transitions during background (setAppBackgrounded) — a delayed re-pause
+  // timer can't run there. Playback stays paused when the user returns.
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (state) => {
+      if (state === "background" || state === "inactive") {
+        backgroundedRef.current = true;
+        adapterRef.current?.setAppBackgrounded?.(true);
+        // pause() reaches the native player — a throw here would be an
+        // uncaught error inside an AppState listener (no boundary above).
+        try {
+          adapterRef.current?.pause();
+        } catch (e) {
+          console.warn("[HevcPlayer] background pause failed:", e);
+        }
+      } else if (state === "active") {
+        backgroundedRef.current = false;
+        lastActiveAtRef.current = Date.now();
+        adapterRef.current?.setAppBackgrounded?.(false);
+      }
+    });
+    return () => sub.remove();
+  }, []);
+
+  // Inform adapter whether current link was probe-validated and provide size hint for metadata timeout
+  useEffect(() => {
+    adapter.setProbeValidated(
+      linkStatusesRef.current[activeLinkIndex] === "valid",
+    );
+    const sizeBytes =
+      currentLink?._meta?.sizeBytes ?? (currentLink as any)?.sizeBytes;
+    adapter.setEstimatedSizeBytes(
+      typeof sizeBytes === "number" ? sizeBytes : undefined,
+    );
+
+    // Recompute and re-apply bufferOptions dynamically on every source switch
+    const currentContainer = detectContainer(
+      currentLink?.name ?? "",
+      activeUrl,
+    );
+    const currentCodec = detectCodec(
+      currentLink?.name ?? "",
+      activeUrl,
+      currentLink?._meta,
+    );
+    player.bufferOptions = getBufferProfile(currentContainer, currentCodec);
+  }, [adapter, activeLinkIndex, activeUrl, currentLink, player]);
+
+  // ── Transient toast (auto-switch confirmation, aspect toggle) ──
+  const showToast = useCallback((text: string) => {
+    setAutoToast(text);
+    if (autoToastTimerRef.current) clearTimeout(autoToastTimerRef.current);
+    autoToastTimerRef.current = setTimeout(() => setAutoToast(null), 2500);
+  }, []);
+
+  // ── Rebuffer watchdog ──
+  // Reports a struggling source but NEVER swaps it automatically: once a
+  // source has delivered frames, only the user decides when to leave it
+  // (desktop rule — auto-swaps on "slow" kept breaking healthy streams that
+  // were recovering). Hard failures still fall back via the error/switch-
+  // timeout paths; pre-start stalling is the switch timeout's job.
+  useEffect(() => {
+    let stallStartedAt: number | null = null;
+    const unsub = adapter.onBuffering((isBuffering) => {
+      // Background stalls (network throttled while away) are not the source's
+      // fault and must not accumulate into a background source swap.
+      if (backgroundedRef.current) {
+        stallStartedAt = null;
+        setPlayerStruggling(false);
+        return;
+      }
+      if (endedRef.current) return;
+      if (isBuffering) {
+        // Seek-induced loading is expected, not a stall — the user asked for a
+        // new position and playback must restart there. Without this, rapid
+        // seeking reads as "3 rebuffers" and swaps away a healthy source.
+        if (adapter.isSeeking?.()) return;
+        // Pre-start buffering is the switch timeout's job; only stalls after
+        // this source actually delivered frames count.
+        if (hasPlayedRef.current) {
+          stallStartedAt = Date.now();
+          perfRef.current?.rebufferStart();
+          // G2: hold subtitle-scan network reads while playback is starved.
+          setPlayerStruggling(true);
+        }
+        return;
+      }
+      if (stallStartedAt == null) return;
+      const stallDurationMs = Date.now() - stallStartedAt;
+      stallStartedAt = null;
+      perfRef.current?.rebufferEnd();
+      setPlayerStruggling(false);
+      // P1 — one buffer_stall per completed rebuffer. Position comes from the
+      // adapter's playhead (not a seek signal), bucketed client-side.
+      {
+        let pos = 0;
+        try {
+          pos = adapter.getCurrentTime();
+        } catch {}
+        const providerId =
+          links?.[activeIndexRef.current]?._meta?.providerId ?? "unknown";
+        trackBufferStall({
+          positionMs: pos,
+          durationMs: stallDurationMs,
+          providerId,
+          mediaType: mediaType ?? "movie",
+        });
+      }
+      // A seek interrupting an in-flight stall is user action — keep it in
+      // telemetry but don't count it against the source.
+      if (adapter.isSeeking?.()) return;
+      const now = Date.now();
+      const times = rebufferTimesRef.current;
+      const { rebufferLimit, rebufferWindowMs } = getPlayerTuning();
+      times.push(now);
+      while (times.length > 0 && now - times[0] > rebufferWindowMs)
+        times.shift();
+      if (times.length >= rebufferLimit) {
+        times.length = 0;
+        const idx = activeIndexRef.current;
+        if (slowToastShownForRef.current !== idx) {
+          slowToastShownForRef.current = idx;
+          console.log(
+            `[HevcPlayer] ${rebufferLimit} rebuffers in ${rebufferWindowMs / 1000}s — source ${idx} struggling (no auto-swap)`,
+          );
+          showToast(
+            "Source is slow — pick another source if it keeps stuttering",
+          );
+        }
+      }
+    });
+    return () => {
+      unsub();
+      // Never leave a scan paused after the player goes away.
+      setPlayerStruggling(false);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [adapter, showToast]);
+
+  // ── Restore this series' subtitle sync offset (manual + auto, persisted per series) ──
+  useEffect(() => {
+    if (!subtitleKey) return;
+    let cancelled = false;
+    Promise.all([getSubtitleOffset(subtitleKey), getAutoSyncPrefs(subtitleKey)])
+      .then(([manualSec, auto]) => {
+        if (cancelled) return;
+        const totalMs = auto.autoOffsetMs + manualSec * 1000;
+        if (totalMs !== 0) {
+          adapter.setSubtitleOffset(totalMs);
+          console.log(
+            `[SubSync] restored offset for ${subtitleKey}: auto=${(auto.autoOffsetMs / 1000).toFixed(2)}s manual=${manualSec.toFixed(1)}s`,
+          );
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [adapter, subtitleKey]);
+
+  // ── Perf instrumentation stage marks ──
+  useEffect(() => {
+    if (links && links.length > 0) {
+      perfRef.current?.mark("links");
+      // [watchperf] FIX 1 — linksSet when links land in player state (mount path).
+      perfRef.current?.mark("linksSet", {
+        provider: links[0]?._meta?.providerId,
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  useEffect(() => {
+    perfRef.current?.mark("player");
+  }, [player]);
+
+  // ── Auto-select the audio track matching the preferred language ──
+  // Track lists populate asynchronously after readyToPlay with no change
+  // event, so poll with backoff until they appear (up to 5 attempts).
+  useEffect(() => {
+    let attempts = 0;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let cancelled = false;
+
+    const tryApply = () => {
+      if (cancelled) return;
+      if (userAudioTouchedRef.current) return;
+      if (audioAutoAppliedRef.current === activeLinkIndex) return;
+      const a = adapterRef.current;
+      if (!a) return;
+      const tracks = a.getAudioTracks();
+
+      if (!tracks || tracks.length === 0) {
+        attempts++;
+        if (attempts < 5) {
+          timer = setTimeout(tryApply, 500);
+        } else if (hasStarted) {
+          console.warn("[HevcPlayer] Video source appears to have no audio tracks.");
+        }
+        return;
+      }
+
+      if (tracks.length === 1) {
+        // Single audio track is already selected by default by ExoPlayer — do not force override.
+        audioAutoAppliedRef.current = activeLinkIndex;
+        return;
+      }
+
+      const pick = pickPreferredTrack(tracks, preferredLanguage);
+      if (pick && pick.id) {
+        a.setAudioTrack(pick.id);
+        audioAutoAppliedRef.current = activeLinkIndex;
+        const display =
+          humanizeAudioLanguage(pick.language) ??
+          humanizeAudioLanguage(pick.label) ??
+          pick.label ??
+          "preferred language";
+        console.log(
+          `[HevcPlayer] Auto-selected audio track "${pick.label}" (preference=${preferredLanguage})`,
+        );
+        showToast(`Audio set to ${display}`);
+      }
+    };
+
+    timer = setTimeout(tryApply, 800);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [activeLinkIndex, preferredLanguage, hasStarted]);
+
+  // Successful playback clears switching/error state and heals the link's status
+  useEffect(() => {
+    const unsub = adapter.onTimeUpdate((time, dur) => {
+      if (time > 0) {
+        const firstFrames = !hasPlayedRef.current;
+        hasPlayedRef.current = true;
+        setHasStarted(true);
+        lastPlaybackTimeRef.current = time;
+        if (firstFrames) perfRef.current?.mark("firstFrame");
+
+        // Auto-switch transparency: confirm what the app decided, once.
+        if (firstFrames && pendingAutoToastRef.current) {
+          pendingAutoToastRef.current = false;
+          const link = links?.[activeLinkIndex];
+          const override = autoToastOverrideRef.current;
+          autoToastOverrideRef.current = null;
+          showToast(
+            override ??
+              `Now playing source ${activeLinkIndex + 1}${
+                link?.quality ? ` · ${link.quality}` : ""
+              }`,
+          );
+        }
+
+        // Skip Intro/Recap window — segments come from the host (introdb).
+        if (introSegments) {
+          const active = getActiveSkipSegment(introSegments, time);
+          const label = active?.label ?? null;
+          if (label !== skipSegmentLabelRef.current) {
+            skipSegmentLabelRef.current = label;
+            setSkipSegment(
+              active
+                ? { endSec: active.segment.end_sec, label: active.label }
+                : null,
+            );
+          }
+        } else if (skipSegmentLabelRef.current !== null) {
+          skipSegmentLabelRef.current = null;
+          setSkipSegment(null);
+        }
+
+        // Next-episode CARD arming (button only — the countdown starts at
+        // natural end): outro window (introdb) when we have usable data,
+        // otherwise the last 5 minutes of the episode. Purely positional —
+        // the playhead got there, the button shows; no watch-time gate.
+        if (
+          mediaType === "tv" &&
+          nextEpisode &&
+          onNextEpisode &&
+          dur > 0 &&
+          !autoNextCancelledRef.current &&
+          !nextUpRef.current
+        ) {
+          const outro = introSegments?.outro;
+          const outroStart =
+            isSegmentUsable(outro) &&
+            outro.start_sec > 0 &&
+            outro.start_sec < dur
+              ? outro.start_sec
+              : null;
+          const nearEnd =
+            outroStart !== null
+              ? time >= outroStart
+              : dur - time <= NEXT_EPISODE_ARM_BEFORE_END_S;
+          if (nearEnd) {
+            nextUpRef.current = true;
+            setNextUp(true);
+            console.log(
+              `[HevcPlayer] Next-episode card armed (${
+                outroStart !== null
+                  ? `outro @ ${Math.round(outroStart)}s`
+                  : "5 min remaining"
+              })`,
+            );
+          }
+        }
+
+        // One-shot resume correction: the currentTime assignment in the
+        // player's setup callback can be silently dropped while a remote
+        // source is still preparing — re-apply it once frames report ~0.
+        if (startAt > 0 && resumeAppliedRef.current !== startAt) {
+          resumeAppliedRef.current = startAt;
+          if (time < Math.min(5, startAt * 0.5)) {
+            adapter.seek(startAt);
+            resumeCorrectedRef.current = true;
+          }
+        }
+
+        // Remember the source that actually works so the next watch of this
+        // title can start from it directly (identity without expiring tokens)
+        if (firstFrames && tmdbId) {
+          const url = links?.[activeLinkIndex]?.url;
+          if (url)
+            rememberWorkingSource(mediaType, tmdbId, url).catch(() => {});
+        }
+
+        failedLinksRef.current.delete(activeLinkIndex);
+        playbackFailedRef.current.delete(activeLinkIndex);
+        if (linkStatusesRef.current[activeLinkIndex] !== "valid") {
+          linkStatusesRef.current = {
+            ...linkStatusesRef.current,
+            [activeLinkIndex]: "valid",
+          };
+          setLinkStatuses(linkStatusesRef.current);
+        }
+        if (switchTimeoutRef.current) {
+          clearTimeout(switchTimeoutRef.current);
+          switchTimeoutRef.current = null;
+        }
+        setSwitchInfo(null);
+        setStreamError(null);
+        exhaustedRef.current = false;
+        setExhausted(false);
+
+        // Periodic progress save — closing the app mid-watch keeps ~15s of
+        // position instead of losing everything. percent is a 0–1 fraction.
+        if (dur > 0 && tmdbId && time - lastSavedPositionRef.current >= 15) {
+          lastSavedPositionRef.current = time;
+          saveProgress({
+            tmdbId,
+            mediaType,
+            season: playSeasonRef.current,
+            episode: playEpisodeRef.current,
+            isAnime,
+            currentTime: time,
+            duration: dur,
+            percent: time / dur,
+            updatedAt: Date.now(),
+            completed: false,
+          }).catch(() => {});
+        }
+
+        // Watch progress threshold tracking — fires at 25/50/75/100% crossings.
+        if (dur > 0 && tmdbId) {
+          const pct = (time / dur) * 100;
+          const thresholds: Array<{
+            threshold: 25 | 50 | 75 | 100;
+            pct: number;
+          }> = [
+            { threshold: 25, pct: 25 },
+            { threshold: 50, pct: 50 },
+            { threshold: 75, pct: 75 },
+            { threshold: 100, pct: 100 },
+          ];
+          const link = links?.[activeIndexRef.current];
+          for (const { threshold, pct: thresholdPct } of thresholds) {
+            if (
+              pct >= thresholdPct &&
+              !watchedThresholdsRef.current.has(threshold)
+            ) {
+              watchedThresholdsRef.current.add(threshold);
+              trackWatchProgress({
+                sessionId: getSessionId(),
+                tmdbId: Number(tmdbId),
+                mediaType: mediaType ?? "movie",
+                season: playSeasonRef.current ?? undefined,
+                episode: playEpisodeRef.current ?? undefined,
+                watchedPctThreshold: threshold,
+                qualityBucket: link?.quality
+                  ? bucketQuality(link.quality)
+                  : undefined,
+                providerId: link?._meta?.providerId ?? undefined,
+                surface: "direct",
+              });
+            }
+          }
+        }
+      }
+    });
+    return unsub;
+  }, [
+    adapter,
+    activeLinkIndex,
+    links,
+    tmdbId,
+    mediaType,
+    season,
+    episode,
+    isAnime,
+    startAt,
+    introSegments,
+    nextEpisode,
+    onNextEpisode,
+    showToast,
+  ]);
+
+  // Log source changes for diagnostics — every switch reloads from scratch,
+  // so the overlay's loading state comes back until frames arrive again.
+  useEffect(() => {
+    if (migrationRemapRef.current) {
+      // Links-refresh remap pass: same URL, new index — keep the current
+      // source-URL ref and all playback state exactly as they are.
+      migrationRemapRef.current = false;
+      return;
+    }
+    const url = currentLink?.url ?? null;
+    const urlChanged = url !== currentSourceUrlRef.current;
+    const firstOpen = !segmentOpenedRef.current;
+    currentSourceUrlRef.current = url;
+    if (!urlChanged && !firstOpen) {
+      // Index remap on the same source (links refresh migration) — playback
+      // state stays intact.
+      return;
+    }
+    if (urlChanged) {
+      console.log(
+        `[Flow] player: active source → #${activeLinkIndex} ${currentLink?.quality ?? ""} ${url?.slice(0, 60)}`,
+      );
+    }
+    // E1: open a per-source segment once a real URL is applied (first pass
+    // + every switch). Skip null urls (links not landed yet).
+    if ((firstOpen || urlChanged) && url) {
+      segmentOpenedRef.current = true;
+      perfRef.current?.noteSourceSegmentOpen(
+        activeLinkIndex,
+        currentLink?.quality,
+      );
+    }
+    if (!urlChanged) return;
+    // I-1: a real URL/source switch is an allowed stop — but only here (where
+    // urlChanged is proven), never from hasStarted flicker alone.
+    if (watchSessionStatus().active) {
+      stopWatchSession("source-change");
+    }
+    setHasStarted(false);
+    hasPlayedRef.current = false;
+    lastSavedPositionRef.current = 0;
+  }, [activeLinkIndex, currentLink]);
+
+  // ── Next episode (TV): card near the end + countdown auto-advance ──
+  const goNextEpisode = useCallback(
+    (fromCountdown = false) => {
+      if (!nextEpisode || !onNextEpisode) return;
+      nextUpRef.current = false;
+      countdownActiveRef.current = false;
+      setNextUp(false);
+      setCountdownActive(false);
+      if (nextCountdownTimerRef.current) {
+        clearInterval(nextCountdownTimerRef.current);
+        nextCountdownTimerRef.current = null;
+      }
+      trackFeatureUsed(
+        fromCountdown ? "next_episode_auto" : "next_episode_manual",
+        "player",
+      );
+      onNextEpisode(nextEpisode.season, nextEpisode.episode);
+    },
+    [nextEpisode, onNextEpisode],
+  );
+
+  const cancelAutoNext = useCallback(() => {
+    autoNextCancelledRef.current = true;
+    nextUpRef.current = false;
+    countdownActiveRef.current = false;
+    setNextUp(false);
+    setCountdownActive(false);
+  }, []);
+
+  useEffect(() => {
+    if (!countdownActive) return;
+    setNextCountdown(NEXT_EPISODE_COUNTDOWN_S);
+    const deadline = Date.now() + NEXT_EPISODE_COUNTDOWN_S * 1000;
+    nextCountdownTimerRef.current = setInterval(() => {
+      const left = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+      setNextCountdown(left);
+      if (left <= 0) {
+        if (nextCountdownTimerRef.current) {
+          clearInterval(nextCountdownTimerRef.current);
+          nextCountdownTimerRef.current = null;
+        }
+        goNextEpisode(true);
+      }
+    }, 250);
+    return () => {
+      if (nextCountdownTimerRef.current) {
+        clearInterval(nextCountdownTimerRef.current);
+        nextCountdownTimerRef.current = null;
+      }
+    };
+  }, [countdownActive, goNextEpisode]);
+
+  // ── Stage C: watch-sync session teardown ──
+  // Activation is tap-only (Auto-Sync / watch-sync alternative) — never
+  // auto-started here. HevcPlayer only stops on source change / unmount /
+  // natural end and re-anchors after seeks resolve while a session is active.
+  //
+  // I-1: `hasStarted` can flip false transiently (source-select reset at
+  // :541, URL-change effect at :1388) WITHOUT a real content change. The
+  // session is keyed by subtitleKey (media identity) — only stop when that
+  // identity actually changes or the player is going away, never on a
+  // hasStarted flicker (sheet open/close never touches either).
+  const watchContentKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!WATCH_SYNC_ENABLED) return;
+    const prev = watchContentKeyRef.current;
+    if (prev !== null && prev !== subtitleKey && watchSessionStatus().active) {
+      // Real content change (episode/media) — allowed stop.
+      stopWatchSession("source-change");
+    }
+    watchContentKeyRef.current = subtitleKey;
+    if (!subtitleKey && watchSessionStatus().active) {
+      // Lost the content identity entirely (media unmounted mid-session).
+      stopWatchSession("source-or-unmounted");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subtitleKey]);
+
+  // Immediate anchor after a user seek resolves (isSeeking true → false),
+  // only while a watch session is active (tap-only activation).
+  const wasSeekingRef = useRef(false);
+  useEffect(() => {
+    const iv = setInterval(() => {
+      const seeking = adapter.isSeeking?.() ?? false;
+      if (wasSeekingRef.current && !seeking && watchSessionStatus().active) {
+        const pos = adapterRef.current?.getCurrentTime() ?? 0;
+        if (pos > 0) anchorWatchSession(pos);
+      }
+      wasSeekingRef.current = seeking;
+    }, 400);
+    return () => clearInterval(iv);
+  }, [adapter]);
+
+  // ── Natural end of media ──
+  // TV with a next episode: start the auto-advance countdown. Movies (or the
+  // final episode): stop quietly — NEVER fall back to another source here,
+  // the stream was fine, the file is simply over.
+  useEffect(() => {
+    if (!adapter.onEnded) return;
+    const unsub = adapter.onEnded(() => {
+      if (endedRef.current) return;
+      endedRef.current = true;
+      console.log("[HevcPlayer] Playback reached natural end");
+      stopWatchSession("video-end");
+      if (switchTimeoutRef.current) {
+        clearTimeout(switchTimeoutRef.current);
+        switchTimeoutRef.current = null;
+      }
+      setSwitchInfo(null);
+      setStreamError(null);
+      pendingAutoToastRef.current = false;
+      // Stop expo-video's end-of-stream play() retry loop + buffering spinner.
+      try {
+        adapter.pause();
+      } catch (e) {
+        console.warn("[HevcPlayer] end-of-stream pause failed:", e);
+      }
+
+      if (
+        mediaType === "tv" &&
+        nextEpisode &&
+        onNextEpisode &&
+        !autoNextCancelledRef.current
+      ) {
+        nextUpRef.current = true;
+        setNextUp(true);
+        if (!countdownActiveRef.current) {
+          countdownActiveRef.current = true;
+          setCountdownActive(true);
+        }
+      }
+      // else: ended — stay stopped.
+    });
+    return unsub;
+  }, [adapter, mediaType, nextEpisode, onNextEpisode]);
+
+  // Error-based fallback (safety net for playback failures the probe didn't catch)
+  useEffect(() => {
+    if (!adapter.onError) return;
+
+    const unsubscribe = adapter.onError((error) => {
+      // Natural end can look like a stall/error to the watchdog — it isn't.
+      if (endedRef.current) return;
+      const errMsg = error || "Playback error";
+      console.log(`[Flow] playback error on #${activeLinkIndex}: "${errMsg}"`);
+
+      // An error seconds after enabling a subtitle track is the track failing
+      // to decode (e.g. an unsupported text codec in this MKV), not the source
+      // dying. Turn subtitles off and keep playing — switching sources here
+      // discards a perfectly healthy stream.
+      if (adapter.subtitleJustEnabled?.()) {
+        console.log(
+          `[HevcPlayer] Error right after subtitle selection — disabling subtitles, keeping source`,
+        );
+        adapter.setSubtitleTrack("off");
+        // A failed text renderer can leave ExoPlayer idle; a seek to the
+        // current position re-prepares the pipeline without losing the source.
+        const t = adapter.getCurrentTime();
+        if (t > 1) adapter.seek(t);
+        showToast("Subtitle track failed — subtitles turned off");
+        return;
+      }
+
+      // P1 — classify the failure for the player_error event (no raw text
+      // ever leaves the device; only the coarse enum).
+      {
+        const providerId =
+          links?.[activeLinkIndex]?._meta?.providerId ?? "unknown";
+        const lower = errMsg.toLowerCase();
+        const errorClass =
+          lower.includes("404") && !lower.includes("410")
+            ? "provider_404"
+            : lower.includes("410")
+              ? "provider_410"
+              : lower.includes("drm") || lower.includes("license")
+                ? "drm"
+                : lower.includes("decode") ||
+                    lower.includes("format") ||
+                    lower.includes("codec") ||
+                    lower.includes("unsupported")
+                  ? "decode"
+                  : lower.includes("network") ||
+                      lower.includes("timeout") ||
+                      lower.includes("connect") ||
+                      lower.includes("socket") ||
+                      lower.includes("failed to fetch") ||
+                      lower.includes("net::") ||
+                      lower.includes("cors")
+                    ? "network"
+                    : "other";
+        trackPlayerError({
+          errorClass,
+          surface: "direct",
+          providerId,
+          mediaType: mediaType ?? "movie",
+        });
+      }
+
+      // The probe said this link was fine but playback disagrees — forget the
+      // cached verdict so a retry re-checks it.
+      const failedUrl = links?.[activeLinkIndex]?.url;
+      if (failedUrl) invalidateValidation(failedUrl);
+
+      // A manually-picked source that errors has ended its contract — the
+      // priority chain takes over (with the last-working rescue at the end).
+      isManualSelectionRef.current = false;
+      setStreamError(null);
+      // Downloaded file: no chain, no provider hop — the card states the
+      // real failure and offers a plain retry of the same file.
+      if (offline) {
+        setStreamError(offlineErrorInfo(errMsg));
+        return;
+      }
+      fallbackToNextLink(activeLinkIndex, "error");
+    });
+
+    return unsubscribe;
+  }, [adapter, isMultiLink, links, activeLinkIndex, offline]);
+
+  // ── User actions ──
+
+  const retryCurrentLink = useCallback(() => {
+    const idx = activeLinkIndex;
+    const url = links?.[idx]?.url ?? activeUrl;
+    if (url) invalidateValidation(url);
+
+    failedLinksRef.current.delete(idx);
+    playbackFailedRef.current.delete(idx);
+    linkStatusesRef.current = { ...linkStatusesRef.current };
+    delete linkStatusesRef.current[idx];
+    setLinkStatuses(linkStatusesRef.current);
+
+    // One manual retry is enough — after it, let auto-fallback act again.
+    isManualSelectionRef.current = false;
+    setStreamError(null);
+    exhaustedRef.current = false;
+    setExhausted(false);
+    setSwitchInfo({ toIndex: idx, auto: false });
+    // Force a fresh open of the same URL (cached responses, stale sockets)
+    player.replaceAsync(videoSource).catch((e) => {
+      console.log(`[HevcPlayer] replaceAsync on retry failed: ${e}`);
+    });
+  }, [activeLinkIndex, links, activeUrl, player, videoSource]);
+
+  const recheckAllSources = useCallback(() => {
+    clearValidationCache();
+    clearPrefetchCache();
+    failedLinksRef.current.clear();
+    playbackFailedRef.current.clear();
+    userLeftWorkingRef.current = [];
+    linkStatusesRef.current = {};
+    setLinkStatuses({});
+    isManualSelectionRef.current = false;
+    setStreamError(null);
+    exhaustedRef.current = false;
+    setExhausted(false);
+    setActiveLinkIndex(defaultIndex);
+    recheckTokenRef.current += 1;
+    setRecheckToken(recheckTokenRef.current);
+    setSwitchInfo({ toIndex: defaultIndex, auto: false });
+    player.replaceAsync(videoSource).catch((e) => {
+      console.log(`[HevcPlayer] replaceAsync on recheck failed: ${e}`);
+    });
+  }, [defaultIndex, player, videoSource]);
+
+  const handleSelectSource = useCallback(
+    (idx: number) => {
+      if (idx === activeLinkIndex) return;
+      // Leaving a source that delivered frames and hasn't failed: park it as
+      // the "last working" reserve. The chain won't bounce the user back to
+      // it mid-way — it's only consumed when everything else has failed.
+      if (
+        hasPlayedRef.current &&
+        !failedLinksRef.current.has(activeLinkIndex) &&
+        !playbackFailedRef.current.has(activeLinkIndex)
+      ) {
+        if (!userLeftWorkingRef.current.includes(activeLinkIndex)) {
+          userLeftWorkingRef.current.push(activeLinkIndex);
+        }
+      }
+      // Re-picking a reserved source clears its reservation.
+      userLeftWorkingRef.current = userLeftWorkingRef.current.filter(
+        (i) => i !== idx,
+      );
+      isManualSelectionRef.current = true;
+      setStreamError(null);
+      exhaustedRef.current = false;
+      setExhausted(false);
+      // beginSwitch arms the never-started safety net for manual picks too —
+      // a "green" link that hangs forever used to spin until the user gave
+      // up; now the switch timeout condemns it and the chain takes over.
+      beginSwitch(idx, false, undefined, "user");
+    },
+    [activeLinkIndex, beginSwitch],
+  );
+  // ── Source inspection/selection API for the host (watch page hub) ──
+  const sourceApiRef = useRef(onRegisterSourceApi);
+  useEffect(() => {
+    sourceApiRef.current = onRegisterSourceApi;
+  }, [onRegisterSourceApi]);
+  // handleSelectSource ref — the registration effect below runs before the
+  // handler's declaration site in source order, so route through a ref.
+  const handleSelectSourceRef = useRef<((idx: number) => void) | null>(null);
+  handleSelectSourceRef.current = handleSelectSource;
+  useEffect(() => {
+    sourceApiRef.current?.({
+      getLinks: () => links ?? [],
+      getActiveIndex: () => activeIndexRef.current,
+      getStatuses: () => linkStatuses,
+      getRecommendedIndex: () => selection.index,
+      getLastUsedIndex: () => lastWorkingIndex,
+      select: (idx: number) => handleSelectSourceRef.current?.(idx),
+    });
+    return () => sourceApiRef.current?.(null);
+    // Re-register when any inspected value changes so the hub sees fresh data.
+  }, [links, linkStatuses, selection.index, lastWorkingIndex]);
+
+  // ── Live language re-selection ──
+  // The "Best" badge is NOT computed here — it mirrors the chain head (what
+  // plays). Only an actual language-preference CHANGE acts: before anything
+  // has played, re-rank and switch (beginSwitch moves the badge with it).
+  // Once playback is healthy, never interrupt — the picker's section grouping
+  // already reflects the new preference without a re-rank.
+  const lastLangRef = useRef(preferredLanguage);
+  useEffect(() => {
+    if (!links || links.length <= 1) return;
+    const langChanged = lastLangRef.current !== preferredLanguage;
+    lastLangRef.current = preferredLanguage;
+    if (!langChanged) return;
+    let cancelled = false;
+    selectBestStream(links, {
+      preferredLanguage,
+      runtimeMinutes: mediaType === "tv" ? 45 : 120,
+    }).then((sel) => {
+      if (cancelled) return;
+      const startedPlaying =
+        hasPlayedRef.current ||
+        linkStatusesRef.current[activeIndexRef.current] === "valid";
+      if (startedPlaying || isManualSelectionRef.current) return;
+      // The re-rank produces its own chain whose indexes don't map onto the
+      // frozen array held here — switch by URL identity, never by index.
+      const newHead = sel.sortedLinks[sel.bestIndex];
+      const idx = newHead ? links.findIndex((l) => l.url === newHead.url) : -1;
+      if (idx >= 0 && idx !== activeIndexRef.current) {
+        console.log(`[Flow] language change: re-ranked head → #${idx}`);
+        beginSwitch(idx, true, undefined, "switch");
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [preferredLanguage, links]);
+
+  // ── Fullscreen toggle ──
+  // State FIRST, orientation lock second (non-blocking). Awaiting the lock
+  // before flipping let the screen rotate while the host's directFullscreen
+  // was still false: the hub stayed mounted, the host box collapsed to
+  // screen − hub, and the bottom bar/column overflowed off-screen. A rejected
+  // lock also stranded the flags mid-transition. The lock is advisory here —
+  // the host effect issues the same one with a catch.
+  const toggleFullscreen = useCallback(() => {
+    const next = !isFullscreen;
+    setIsFullscreen(next);
+    onFullscreenChange?.(next);
+    ScreenOrientation.lockAsync(
+      next
+        ? ScreenOrientation.OrientationLock.LANDSCAPE
+        : ScreenOrientation.OrientationLock.PORTRAIT_UP,
+    ).catch(() => {});
+  }, [isFullscreen, onFullscreenChange]);
+
+  // Host-driven fullscreen (the watch-page overlay's expand button) — apply the
+  // same orientation lock and mirror the state. Skips when it matches, so the
+  // internal toggle → onFullscreenChange → host → back here loop is a no-op.
+  useEffect(() => {
+    if (externalFullscreen === undefined) return;
+    setIsFullscreen((prev) => {
+      if (prev === externalFullscreen) return prev;
+      ScreenOrientation.lockAsync(
+        externalFullscreen
+          ? ScreenOrientation.OrientationLock.LANDSCAPE
+          : ScreenOrientation.OrientationLock.PORTRAIT_UP,
+      ).catch(() => {});
+      return externalFullscreen;
+    });
+  }, [externalFullscreen]);
+
+  // Offline/local playback opens directly in fullscreen landscape. The lock is
+  // taken on mount and released on unmount — closing via the Android back
+  // button never calls handleClose, so the cleanup is what guarantees the app
+  // returns to portrait after a local file finishes playing.
+  useEffect(() => {
+    if (!startFullscreen) return;
+    ScreenOrientation.getOrientationAsync()
+      .then((o) =>
+        console.log(
+          `[Flow] offline mount: orientation=${o} → locking LANDSCAPE (fullscreen-at-mount)`,
+        ),
+      )
+      .catch(() => {});
+    ScreenOrientation.lockAsync(
+      ScreenOrientation.OrientationLock.LANDSCAPE,
+    ).catch(() => {});
+    return () => {
+      ScreenOrientation.lockAsync(
+        ScreenOrientation.OrientationLock.PORTRAIT_UP,
+      ).catch(() => {});
+    };
+  }, [startFullscreen]);
+
+  // ── Close handler — save progress, restore orientation ──
+  const handleClose = useCallback(async () => {
+    const current = adapterRef.current;
+    if (current) {
+      const time = current.getCurrentTime();
+      const dur = current.getDuration();
+      if (tmdbId && time > 0 && dur > 0) {
+        // percent is a 0–1 FRACTION in the store (was wrongly 0–100 here,
+        // which marked every video ≥1% watched as completed)
+        await saveProgress({
+          tmdbId,
+          mediaType,
+          season: playSeasonRef.current,
+          episode: playEpisodeRef.current,
+          isAnime,
+          currentTime: time,
+          duration: dur,
+          percent: time / dur,
+          updatedAt: Date.now(),
+          completed: false,
+        });
+      }
+    }
+
+    if (isFullscreen) {
+      await ScreenOrientation.lockAsync(
+        ScreenOrientation.OrientationLock.PORTRAIT_UP,
+      ).catch(() => {});
+    }
+
+    if (switchTimeoutRef.current) clearTimeout(switchTimeoutRef.current);
+    if (nextCountdownTimerRef.current) {
+      clearInterval(nextCountdownTimerRef.current);
+      nextCountdownTimerRef.current = null;
+    }
+    if (autoToastTimerRef.current) clearTimeout(autoToastTimerRef.current);
+    // Stop audio immediately — destroy() alone does not pause native playback.
+    try {
+      adapter.pause();
+    } catch {}
+    try {
+      player.pause();
+    } catch {}
+    // P5 — completion curve + resume-correction dims for watch_end.
+    perfRef.current?.close(
+      current && current.getDuration() > 0
+        ? (current.getCurrentTime() / current.getDuration()) * 100
+        : undefined,
+      resumeCorrectedRef.current || undefined,
+      "direct",
+    );
+    setActivePerfSession(null);
+    perfRef.current = null;
+    stopWatchSession("close");
+    adapter.destroy();
+    onClose();
+  }, [
+    tmdbId,
+    mediaType,
+    season,
+    episode,
+    isFullscreen,
+    onClose,
+    adapter,
+    player,
+  ]);
+
+  // ── Keep screen awake ──
+  useEffect(() => {
+    const unsubs = [
+      adapter.onPlayPause((paused) => {
+        if (!paused) KeepAwake.activateKeepAwakeAsync().catch(() => {});
+        else KeepAwake.deactivateKeepAwake().catch(() => {});
+      }),
+    ];
+    return () => {
+      unsubs.forEach((u) => u());
+      KeepAwake.deactivateKeepAwake().catch(() => {});
+    };
+  }, [adapter]);
+
+  /**
+   * E1: session lifecycle — the PerfSession tracks the whole watch INTENT.
+   * Source switches must NOT close/reopen it (that was the 3628ms vs 12.7s
+   * bug: adapter identity changes on switch and the old unmount-cleanup
+   * closed the session). Only true unmount (or handleClose) closes it.
+   */
+  useEffect(() => {
+    return () => {
+      if (switchTimeoutRef.current) clearTimeout(switchTimeoutRef.current);
+      if (nextCountdownTimerRef.current)
+        clearInterval(nextCountdownTimerRef.current);
+      if (autoToastTimerRef.current) clearTimeout(autoToastTimerRef.current);
+      perfRef.current?.close(undefined, undefined, "direct");
+      setActivePerfSession(null);
+      perfRef.current = null;
+      stopWatchSession("unmount");
+      // P5 — impatience signal: session ended while a source switch was
+      // still in flight (never produced frames before the user left).
+      if (switchInfoRef.current) {
+        trackExitDuringSwitch({
+          surface: "direct",
+          switchKind: switchInfoRef.current.auto
+            ? "auto-fallback"
+            : "manual-pick",
+        });
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /**
+   * Adapter teardown rides the ADAPTER identity (a source switch builds a
+   * new ExpoVideoAdapter from the new player) — destroy the old one, but
+   * never touch the PerfSession here.
+   */
+  useEffect(() => {
+    const a = adapter;
+    return () => {
+      a.destroy();
+    };
+  }, [adapter]);
+  // ── Derived display data ──
+  const containerLabel =
+    container === "unknown"
+      ? (currentLink?.type || "VIDEO").toUpperCase()
+      : container.toUpperCase();
+
+  const activeLanguages = currentLink
+    ? parseLinkLanguages(currentLink.name)
+    : [];
+  // UI fix: quality-first pill — show the playing link's quality (e.g. "720p"),
+  // provider name only as fallback when quality is unknown.
+  const sourceSummary = currentLink?.quality
+    ? currentLink.quality
+    : providerDisplayName
+      ? [
+          containerLabel,
+          activeLanguages.length > 0 ? activeLanguages[0].toUpperCase() : null,
+        ]
+          .filter(Boolean)
+          .join(" · ") || providerDisplayName
+      : [
+          currentLink?.quality,
+          containerLabel,
+          activeLanguages.length > 0 ? activeLanguages[0].toUpperCase() : null,
+        ]
+          .filter(Boolean)
+          .join(" · ");
+
+  // What the loading spinner says — makes "what is it doing" visible. The
+  // winner was probe-checked BEFORE mount, so this describes only the
+  // current source; background verification of the other links starts after
+  // frames flow and is deliberately not shown here (a ticking "N verified"
+  // counter read like a playback gate when it never was one).
+  const loadingDetail = (() => {
+    if (hasStarted || streamError || exhausted) return "";
+    const status = linkStatuses[activeLinkIndex];
+    const verdict =
+      status === "valid" ? "verified" : status === "dead" ? "failed" : "";
+    return [
+      `Source ${activeLinkIndex + 1}`,
+      currentLink?.quality ?? "",
+      verdict,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+  })();
+
+  // What the switching pill says — never show a bare "Switching…"
+  const switchingLabel = (() => {
+    if (!switchInfo) return "";
+    const n = switchInfo.toIndex + 1;
+    const link = links?.[switchInfo.toIndex];
+    const detail = link ? `${link.quality} · ${linkContainerLabel(link)}` : "";
+    return `Trying source ${n} of ${links?.length ?? 0}${detail ? ` — ${detail}` : ""}`;
+  })();
+
+  // ── Edge-to-edge video surface insets (Bug: landscape subtitle/video cut) ──
+  // The app draws edge-to-edge, so a 100%×100% video surface extends under the
+  // transparent gesture-nav / status bars. Media3 renders subtitles anchored
+  // to the surface's bottom edge and the video frame bleeds into the system
+  // bars — the surface must shrink by the system-bar insets in fullscreen.
+  // The overlay already lifts itself (+36 landscape); the surface never did.
+  const insets = useSafeAreaInsets();
+  const { width: winW, height: winH } = useWindowDimensions();
+  // In fullscreen the video surface must live INSIDE the system bars (they're
+  // transparent and this app draws edge-to-edge): Media3 anchors subtitles to
+  // the surface's bottom edge, so a surface that reaches the physical screen
+  // bottom puts subtitles under the gesture-nav bar and bleeds the frame into
+  // system UI. Absolute-positioning with per-edge insets is the geometry that
+  // CANNOT overflow: top/left/right/bottom pin all four edges inward.
+  // (Margins on a 100%-height view were tried and are wrong — Yoga adds
+  // margins OUTSIDE percentage sizes, growing the footprint instead.)
+  //
+  // ── Native Video Dimensions & Aspect Ratio Detection ──
+  const [videoDimensions, setVideoDimensions] = useState<{
+    width: number;
+    height: number;
+  } | null>(() => {
+    const size = player.videoTrack?.size;
+    return size && size.width > 0 && size.height > 0 ? size : null;
+  });
+
+  useEffect(() => {
+    const updateSize = () => {
+      const size = player.videoTrack?.size;
+      if (size && size.width > 0 && size.height > 0) {
+        setVideoDimensions((prev) => {
+          if (prev?.width === size.width && prev?.height === size.height) {
+            return prev;
+          }
+          return { width: size.width, height: size.height };
+        });
+      }
+    };
+    updateSize();
+    const subTrack = player.addListener("videoTrackChange", updateSize);
+    const subSource = player.addListener("sourceChange", updateSize);
+    return () => {
+      subTrack.remove();
+      subSource.remove();
+    };
+  }, [player]);
+
+  const videoAspectRatio = useMemo(() => {
+    if (
+      videoDimensions &&
+      videoDimensions.width > 0 &&
+      videoDimensions.height > 0
+    ) {
+      return videoDimensions.width / videoDimensions.height;
+    }
+    return 16 / 9; // Clean default widescreen standard
+  }, [videoDimensions]);
+
+  // In portrait, compute responsive height respecting video aspect ratio
+  const responsivePortraitHeight = useMemo(() => {
+    const naturalHeight = Math.round(winW / videoAspectRatio);
+    // Bounded between 40% and 52% of window height so it fits screen boundaries
+    const maxHeight = Math.round(winH * 0.48);
+    const minHeight = Math.round(winW * 0.5);
+    return Math.max(minHeight, Math.min(naturalHeight, maxHeight));
+  }, [winW, winH, videoAspectRatio]);
+
+  const surfaceFillsScreen =
+    isFullscreen || winW > winH || externalFullscreen === undefined;
+
+  const responsiveContainerStyle = useMemo(() => {
+    if (surfaceFillsScreen) {
+      return styles.videoFullscreen;
+    }
+    return [
+      styles.videoContainer,
+      {
+        width: winW,
+        height: responsivePortraitHeight,
+      },
+    ];
+  }, [surfaceFillsScreen, winW, responsivePortraitHeight]);
+
+  const videoSurfaceStyle = useMemo(
+    () => ({
+      width: "100%" as const,
+      height: "100%" as const,
+      backgroundColor: colors.playerBg,
+    }),
+    [],
+  );
+
+  // Subtitle position — Media3 anchors subtitles to the surface's bottom
+  // edge; the user-lifted fraction (settings) raises them so they sit clear
+  // of the progress bar / gesture-nav zone. null = auto (the default): Low
+  // (0.14) in portrait, Middle (0.2) in landscape — the landscape surface
+  // is the full screen, so the lifted default sits differently there. An
+  // explicit pin (any number) wins in both orientations. Android-only
+  // native prop (patched expo-video); other platforms ignore it.
+  const subtitleMarginFraction =
+    settings.subtitleBottomMargin ?? (winW > winH ? 0.2 : 0.14);
+  // [SubPos] logs: value handed to the native VideoView prop. Fires when the
+  // setting changes (or orientation default switches) — anime issue is this
+  // value changing but subs not moving (native) vs never changing (JS).
+  useEffect(() => {
+    console.log(
+      `[SubPos] prop value=${subtitleMarginFraction.toFixed(3)} rawSetting=${
+        settings.subtitleBottomMargin
+      } landscape=${winW > winH} fullscreen=${isFullscreen}`,
+    );
+  }, [
+    subtitleMarginFraction,
+    settings.subtitleBottomMargin,
+    winW,
+    winH,
+    isFullscreen,
+  ]);
+  // Immersive video — while the surface fills the screen, the VideoView hides
+  // the OS status + navigation bars (native patch) and restores them on
+  // unmount / focus loss. No edge-to-edge letterboxing surprises: safe-area
+  // insets collapse to ~0 while immersive, so the surface re-expands cleanly.
+  //
+  // The native setter only applies immersiveMode when the prop CHANGES while
+  // the view is attached. A remount (next-episode → links refetch → spinner
+  // swaps HevcPlayer out/in) creates the VideoView with the prop already true
+  // BEFORE it attaches → setter no-ops, onAttachedToWindow never re-applies,
+  // and the bars restored by the old view's detach stay visible under the new
+  // fullscreen video. Arm one frame after mount so every (re)mount lands a
+  // false→true transition while the view is attached.
+  const [immersiveArmed, setImmersiveArmed] = useState(false);
+  useEffect(() => {
+    setImmersiveArmed(false);
+    const id = requestAnimationFrame(() => setImmersiveArmed(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
+  const immersive = surfaceFillsScreen && immersiveArmed;
+
+  // [Q] pinpoint: end of the render body — body-end − render#N = pure render
+  // time; commit − body-end = React reconciliation/children of this pass.
+  if (renderCountRef.current <= 6) {
+    console.log(
+      `[Q] render#N body-end n=${renderCountRef.current} t=${Date.now()}`,
+    );
+  }
+
+  return (
+    <View style={styles.container}>
+      <StatusBar hidden={isFullscreen} barStyle="light-content" />
+
+      {/* ── Player area: video + overlay + page cards (flex:1 above the strip) ── */}
+      <View style={styles.playerArea}>
+        {/* Video surface — fills the box (fixed 50% of screen in portrait,
+          full screen in fullscreen); the video letterboxes INSIDE the surface
+          via contentFit. The surface is 100%×100% from first paint — nothing
+          about this layout changes when metadata or frames arrive → no jump.
+          The overlay lives inside this box so the progress bar is pinned to
+          its bottom edge. */}
+        <View
+          style={responsiveContainerStyle}
+        >
+          <VideoView
+            style={videoSurfaceStyle}
+            player={player}
+            nativeControls={false}
+            allowsPictureInPicture={false}
+            fullscreenOptions={{ enable: false }}
+            contentFit={screenFit}
+            subtitleMarginFraction={subtitleMarginFraction}
+            immersiveMode={immersive}
+          />
+
+          {/* Controls overlay (also carries the switching pill + buffering spinner) */}
+          <PlayerOverlay
+            player={adapter}
+            mediaKey={`${season ?? ""}:${episode ?? ""}`}
+            title={title}
+            backdropUrl={backdropUrl}
+            isFullscreen={isFullscreen}
+            sourceLabel={sourceSummary || currentLink?.quality}
+            isStreamLoading={!hasStarted}
+            switchingLabel={switchInfo ? switchingLabel : null}
+            overlaySuppressed={!!streamError || exhausted}
+            loadingDetail={loadingDetail}
+            introSegments={introSegments}
+            skipLabel={skipSegment?.label}
+            onSkipSegment={
+              skipSegment
+                ? () => adapterRef.current?.seek(skipSegment.endSec)
+                : undefined
+            }
+            onAudioTrackSelected={() => {
+              userAudioTouchedRef.current = true;
+            }}
+            subtitleKey={subtitleKey ?? undefined}
+            subtitleOnlineSearch={subtitleOnlineSearch}
+            subtitleSidecars={subtitleSidecars}
+            autoSync={
+              subtitleKey
+                ? {
+                    contentId: subtitleKey,
+                    sourceInfo: () => {
+                      const s = autoSyncSourceRef.current;
+                      const duration = adapter.getDuration?.() ?? 0;
+                      const c = s.container;
+                      const mapped:
+                        | "mp4"
+                        | "mkv"
+                        | "webm"
+                        | "mov"
+                        | "m4v"
+                        | "other" =
+                        c === "unknown" || c === "mpegts" ? "other" : c;
+                      return {
+                        uri: s.uri,
+                        headers: s.headers,
+                        container: mapped,
+                        durationSec: duration > 0 ? duration : 0,
+                        kind: s.uri.startsWith("http") ? "remote" : "local",
+                      };
+                    },
+                    getDefaultSubtitleUri: () =>
+                      autoAttachedSubtitleRef.current,
+                  }
+                : undefined
+            }
+            onSourcePicker={
+              links && links.length >= 1 ? openStreamPicker : undefined
+            }
+            onToggleFullscreen={toggleFullscreen}
+            onClose={handleClose}
+            hideBack={false}
+          />
+
+          {/* Auto-switch / aspect toast — never intercepts touches */}
+          {autoToast && (
+            <View style={styles.autoToast} pointerEvents="none">
+              <Ionicons name="checkmark-circle" size={14} color={colors.gold} />
+              <Text style={styles.autoToastText}>{autoToast}</Text>
+            </View>
+          )}
+
+          {/* Next-episode card — button near the end, countdown at natural end */}
+          {nextUp &&
+            nextEpisode &&
+            onNextEpisode &&
+            !exhausted &&
+            !streamError && (
+              <View style={styles.nextUpWrap} pointerEvents="box-none">
+                <View style={styles.nextUpCard}>
+                  <TouchableOpacity
+                    style={styles.nextUpMain}
+                    onPress={() => goNextEpisode()}
+                    activeOpacity={0.8}
+                    accessibilityRole="button"
+                    accessibilityLabel={
+                      countdownActive
+                        ? `Next episode in ${nextCountdown} seconds`
+                        : "Play next episode"
+                    }
+                  >
+                    <Ionicons
+                      name="play-skip-forward-outline"
+                      size={15}
+                      color={colors.gold}
+                    />
+                    <Text style={styles.nextUpText}>
+                      {countdownActive
+                        ? `Next Episode in ${nextCountdown}s`
+                        : "Next Episode"}
+                    </Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.nextUpCancel}
+                    onPress={cancelAutoNext}
+                    activeOpacity={0.8}
+                    accessibilityRole="button"
+                    accessibilityLabel="Cancel auto-advance"
+                  >
+                    <Ionicons
+                      name="close"
+                      size={16}
+                      color={colors.textSecondary}
+                    />
+                  </TouchableOpacity>
+                </View>
+              </View>
+            )}
+
+          {/* Error cards — rendered above the controls overlay; the overlay is
+          suppressed while a card is up so nothing covers them */}
+          {streamError && !exhausted && (
+            <ErrorCard
+              icon="alert-circle-outline"
+              title={streamError.title}
+              detail={streamError.detail}
+              primaryLabel="Retry"
+              primaryIcon="refresh-outline"
+              onPrimary={retryCurrentLink}
+              secondaryLabel={isMultiLink ? "Choose source" : undefined}
+              secondaryIcon="server-outline"
+              onSecondary={isMultiLink ? openStreamPicker : undefined}
+              tertiaryLabel={onTryProvider ? "Try Another Server" : undefined}
+              tertiaryIcon="swap-horizontal-outline"
+              onTertiary={onTryProvider}
+            />
+          )}
+
+          {/* All sources exhausted — offer re-check instead of a dead end */}
+          {exhausted && (
+            <ErrorCard
+              icon="cloud-offline-outline"
+              title={`All ${links?.length ?? 0} sources failed`}
+              detail="None of the available streams responded. The links may have expired — re-checking often finds fresh ones."
+              primaryLabel="Re-check all sources"
+              primaryIcon="refresh-outline"
+              onPrimary={recheckAllSources}
+              secondaryLabel="Choose manually"
+              secondaryIcon="list-outline"
+              onSecondary={isMultiLink ? openStreamPicker : undefined}
+              tertiaryLabel={onTryProvider ? "Try Another Server" : undefined}
+              tertiaryIcon="swap-horizontal-outline"
+              onTertiary={onTryProvider}
+            />
+          )}
+        </View>
+      </View>
+
+      {/* Stream picker — ANY link count (single link still gets probe
+          status + retest). Deferred until first open. */}
+      {streamPickerMounted && links && links.length > 0 && (
+        <StreamPickerSheet
+          visible={showStreamPicker}
+          links={links}
+          activeIndex={activeLinkIndex}
+          linkStatuses={linkStatuses}
+          recommendedIndex={selection.index}
+          lastUsedIndex={lastWorkingIndex}
+          preferredLanguage={preferredLanguage}
+          onRetest={recheckAllSources}
+          onSelect={handleSelectSource}
+          onClose={() => setShowStreamPicker(false)}
+        />
+      )}
+    </View>
+  );
+}
+
+/** Shared error/exhausted card — icon, human title/detail, recovery buttons. */
+function ErrorCard({
+  icon,
+  title,
+  detail,
+  primaryLabel,
+  primaryIcon,
+  onPrimary,
+  secondaryLabel,
+  secondaryIcon,
+  onSecondary,
+  tertiaryLabel,
+  tertiaryIcon,
+  onTertiary,
+}: {
+  icon: keyof typeof Ionicons.glyphMap;
+  title: string;
+  detail: string;
+  primaryLabel: string;
+  primaryIcon: keyof typeof Ionicons.glyphMap;
+  onPrimary: () => void;
+  secondaryLabel?: string;
+  secondaryIcon?: keyof typeof Ionicons.glyphMap;
+  onSecondary?: () => void;
+  tertiaryLabel?: string;
+  tertiaryIcon?: keyof typeof Ionicons.glyphMap;
+  onTertiary?: () => void;
+}) {
+  return (
+    <View style={styles.errorOverlay} pointerEvents="box-none">
+      <View
+        style={styles.errorCard}
+        accessibilityRole="alert"
+        accessibilityLiveRegion="polite"
+      >
+        <Ionicons name={icon} size={32} color="#f87171" />
+        <Text style={styles.errorTitle}>{title}</Text>
+        <Text style={styles.errorSubtitle}>{detail}</Text>
+        <TouchableOpacity
+          style={styles.errorButton}
+          onPress={onPrimary}
+          activeOpacity={0.8}
+          accessibilityRole="button"
+          accessibilityLabel={primaryLabel}
+        >
+          <Ionicons name={primaryIcon} size={16} color={colors.playerBg} />
+          <Text style={styles.errorButtonText}>{primaryLabel}</Text>
+        </TouchableOpacity>
+        {secondaryLabel && onSecondary && (
+          <TouchableOpacity
+            style={styles.secondaryButton}
+            onPress={onSecondary}
+            activeOpacity={0.8}
+            accessibilityRole="button"
+            accessibilityLabel={secondaryLabel}
+          >
+            <Ionicons
+              name={secondaryIcon ?? "server-outline"}
+              size={16}
+              color={colors.textPrimary}
+            />
+            <Text style={styles.secondaryButtonText}>{secondaryLabel}</Text>
+          </TouchableOpacity>
+        )}
+        {tertiaryLabel && onTertiary && (
+          <TouchableOpacity
+            style={styles.secondaryButton}
+            onPress={onTertiary}
+            activeOpacity={0.8}
+            accessibilityRole="button"
+            accessibilityLabel={tertiaryLabel}
+          >
+            <Ionicons
+              name={tertiaryIcon ?? "swap-horizontal-outline"}
+              size={16}
+              color={colors.textPrimary}
+            />
+            <Text style={styles.secondaryButtonText}>{tertiaryLabel}</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: colors.playerBg,
+  },
+  playerArea: {
+    flex: 1,
+  },
+  videoContainer: {
+    position: "relative",
+    width: "100%",
+    backgroundColor: colors.playerBg,
+    alignItems: "center",
+    justifyContent: "center",
+    overflow: "hidden",
+  },
+  video: {
+    width: "100%",
+    height: "100%",
+  },
+
+  videoFullscreen: {
+    ...StyleSheet.absoluteFillObject,
+    width: "100%",
+    height: "100%",
+    backgroundColor: colors.playerBg,
+    alignItems: "center",
+    justifyContent: "center",
+    overflow: "hidden",
+  },
+  errorOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(0,0,0,0.75)",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 24,
+    zIndex: 10,
+  },
+  errorCard: {
+    backgroundColor: colors.bgElevated,
+    borderRadius: 16,
+    padding: 24,
+    alignItems: "center",
+    maxWidth: 360,
+    width: "100%",
+    borderWidth: 1,
+    borderColor: "rgba(239,68,68,0.3)",
+    gap: 12,
+  },
+  errorTitle: {
+    color: colors.textPrimary,
+    fontSize: 16,
+    fontWeight: "700",
+    textAlign: "center",
+  },
+  errorSubtitle: {
+    color: colors.textSecondary,
+    fontSize: 13,
+    textAlign: "center",
+    lineHeight: 18,
+  },
+  errorButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    backgroundColor: colors.gold,
+    borderRadius: 10,
+    paddingHorizontal: 18,
+    paddingVertical: 10,
+    marginTop: 6,
+    minHeight: 44,
+    justifyContent: "center",
+  },
+  errorButtonText: {
+    color: colors.playerBg,
+    fontSize: 14,
+    fontWeight: "700",
+  },
+  secondaryButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    backgroundColor: "transparent",
+    borderRadius: 10,
+    paddingHorizontal: 18,
+    paddingVertical: 10,
+    borderWidth: 1,
+    borderColor: colors.borderSubtle,
+    minHeight: 44,
+    justifyContent: "center",
+  },
+  secondaryButtonText: {
+    color: colors.textPrimary,
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  autoToast: {
+    position: "absolute",
+    alignSelf: "center",
+    top: 64,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    backgroundColor: "rgba(14, 14, 17, 0.92)",
+    borderColor: "rgba(212, 162, 55, 0.4)",
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+    zIndex: 50,
+    elevation: 8,
+  },
+  autoToastText: {
+    color: colors.textPrimary,
+    fontSize: 12,
+    fontWeight: "600",
+  },
+  nextUpWrap: {
+    position: "absolute",
+    right: 16,
+    bottom: 96,
+    zIndex: 40,
+    elevation: 8,
+  },
+  nextUpCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "rgba(14, 14, 17, 0.92)",
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: "rgba(212, 162, 55, 0.4)",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.4,
+    shadowRadius: 10,
+  },
+  nextUpMain: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+  },
+  nextUpText: {
+    color: colors.gold,
+    fontSize: 13,
+    fontWeight: "700",
+    fontVariant: ["tabular-nums"],
+  },
+  nextUpCancel: {
+    width: 32,
+    height: 32,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 4,
+  },
+});

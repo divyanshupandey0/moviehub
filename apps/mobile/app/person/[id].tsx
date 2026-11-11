@@ -1,0 +1,331 @@
+import React from "react";
+import {
+  View,
+  Text,
+  ScrollView,
+  TouchableOpacity,
+  ActivityIndicator,
+  useWindowDimensions,
+  Platform,
+} from "react-native";
+import { useLocalSearchParams } from "expo-router";
+import { useSafeNavigation } from "@/lib/navigation";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { BackIcon } from "../../components/Icons";
+import { Ionicons } from "@expo/vector-icons";
+import { getImageUrl } from "@filmsnaps/shared";
+import { ProgressiveImage } from "../../components/ProgressiveImage";
+import { MediaCard } from "../../components/MediaCard";
+import { usePersonDetails, usePersonCredits } from "../../hooks/useTMDB";
+import { openDetail, prepareDetail, toDetailNavItem } from "../../lib/openDetail";
+import { useQueryClient } from "@tanstack/react-query";
+import { useRouter } from "expo-router";
+import { PersonSkeleton } from "../../components/Skeletons";
+import { colors } from "../../theme/colors";
+
+export default function PersonDetailScreen() {
+  const { id } = useLocalSearchParams<{ id: string }>();
+  const personId = Number(id);
+  const nav = useSafeNavigation();
+  const router = useRouter();
+  const queryClient = useQueryClient();
+  const insets = useSafeAreaInsets();
+
+  const { data: person, isLoading: loadingPerson } = usePersonDetails(personId);
+  const { data: creditsData, isLoading: loadingCredits } =
+    usePersonCredits(personId);
+
+  const credits = (creditsData as any)?.cast ?? [];
+
+  const movieCredits = credits
+    .filter((c: any) => c.media_type === "movie")
+    .sort((a: any, b: any) =>
+      (b.release_date || "") > (a.release_date || "") ? 1 : -1,
+    );
+  const tvCredits = credits
+    .filter((c: any) => c.media_type === "tv")
+    .sort((a: any, b: any) =>
+      (b.first_air_date || "") > (a.first_air_date || "") ? 1 : -1,
+    );
+
+  if (loadingPerson) {
+    return <PersonSkeleton />;
+  }
+
+  if (!person) {
+    return (
+      <View
+        className="flex-1 items-center justify-center bg-void px-6"
+        style={{ backgroundColor: colors.bg, paddingTop: insets.top }}
+      >
+        <View className="w-16 h-16 rounded-full bg-elevated items-center justify-center mb-5">
+          <Ionicons
+            name="person-outline"
+            size={32}
+            color={colors.textTertiary}
+          />
+        </View>
+        <Text className="text-text-primary text-lg font-semibold mb-2">
+          Person not found
+        </Text>
+        <TouchableOpacity
+          onPress={() => nav.goBack({ fallback: "/(tabs)" })}
+          className="bg-primary rounded-xl py-3 px-8 mt-4"
+          activeOpacity={0.8}
+        >
+          <Text className="text-void font-bold text-base">Go Back</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  return (
+    <View
+      className="flex-1 bg-void"
+      style={{ backgroundColor: colors.bg, paddingTop: insets.top }}
+    >
+      <ScrollView className="flex-1" showsVerticalScrollIndicator={false}>
+        {/* Back button */}
+        <View className="px-4 pt-2 pb-3">
+          <TouchableOpacity
+            onPress={() => nav.goBack({ fallback: "/(tabs)" })}
+            activeOpacity={0.7}
+            accessibilityLabel="Go back"
+            accessibilityRole="button"
+            style={{
+              flexDirection: "row",
+              alignItems: "center",
+              backgroundColor: "rgba(8,8,8,0.7)",
+              borderRadius: 20,
+              paddingHorizontal: 12,
+              paddingVertical: 6,
+            }}
+          >
+            <BackIcon width={18} height={18} color={colors.textPrimary} />
+            <Text
+              style={{
+                fontFamily: "Inter_500Medium",
+                fontSize: 12,
+                color: colors.textPrimary,
+                marginLeft: 2,
+              }}
+            >
+              Back
+            </Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* Profile header */}
+        <View className="items-center px-6 pb-6">
+          {person.profile_path ? (
+            <ProgressiveImage
+              uri={getImageUrl(person.profile_path, "w185")}
+              style={{
+                width: 120,
+                height: 120,
+                borderRadius: 60,
+                marginBottom: 16,
+                ...Platform.select({
+                  ios: {
+                    shadowColor: colors.playerBg,
+                    shadowOffset: { width: 0, height: 4 },
+                    shadowOpacity: 0.4,
+                    shadowRadius: 8,
+                  },
+                  android: { elevation: 8 },
+                }),
+              }}
+              resizeMode="cover"
+            />
+          ) : (
+            <View
+              style={{
+                width: 120,
+                height: 120,
+                borderRadius: 60,
+                backgroundColor: colors.bgElevated,
+                alignItems: "center",
+                justifyContent: "center",
+                marginBottom: 16,
+              }}
+            >
+              <Ionicons
+                name="person-outline"
+                size={48}
+                color={colors.textTertiary}
+              />
+            </View>
+          )}
+          <Text
+            style={{
+              fontFamily: "PlayfairDisplay_700Bold",
+              fontSize: 24,
+              color: colors.textPrimary,
+              textAlign: "center",
+            }}
+          >
+            {person.name}
+          </Text>
+          {person.known_for_department && (
+            <Text className="text-text-tertiary text-sm mt-1">
+              {person.known_for_department}
+            </Text>
+          )}
+          {person.birthday && (
+            <View className="flex-row items-center mt-2">
+              <Ionicons
+                name="calendar-outline"
+                size={13}
+                color={colors.textSecondary}
+              />
+              <Text className="text-text-tertiary text-xs ml-1.5">
+                {person.birthday}
+                {person.deathday ? ` — ${person.deathday}` : ""}
+              </Text>
+            </View>
+          )}
+          {person.place_of_birth && (
+            <View className="flex-row items-center mt-1">
+              <Ionicons
+                name="location-outline"
+                size={13}
+                color={colors.textSecondary}
+              />
+              <Text className="text-text-tertiary text-xs ml-1.5">
+                {person.place_of_birth}
+              </Text>
+            </View>
+          )}
+        </View>
+
+        {/* Biography */}
+        {person.biography ? (
+          <View className="px-6 mb-8">
+            <Text
+              style={{
+                fontFamily: "PlayfairDisplay_700Bold",
+                fontSize: 18,
+                color: colors.textPrimary,
+                marginBottom: 10,
+              }}
+            >
+              Biography
+            </Text>
+            <Text
+              className="text-text-secondary text-sm leading-5"
+              style={{ lineHeight: 20 }}
+            >
+              {person.biography}
+            </Text>
+          </View>
+        ) : null}
+
+        {/* Filmography — Movies */}
+        {movieCredits.length > 0 && (
+          <View className="mb-8">
+            <Text
+              style={{
+                fontFamily: "PlayfairDisplay_700Bold",
+                fontSize: 18,
+                color: colors.textPrimary,
+                paddingHorizontal: 24,
+                marginBottom: 12,
+              }}
+            >
+              Movies
+            </Text>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={{ paddingHorizontal: 16, gap: 10 }}
+            >
+              {movieCredits.slice(0, 20).map((credit: any) => (
+                <MediaCard
+                  key={`m-${credit.id}`}
+                  item={
+                    {
+                      id: credit.id,
+                      title: credit.title || credit.name,
+                      poster_path: credit.poster_path,
+                      vote_average: credit.vote_average,
+                      media_type: "movie",
+                    } as any
+                  }
+                  onPressIn={(item: any) => {
+                    const navItem = toDetailNavItem(item, "movie");
+                    if (navItem)
+                      prepareDetail(navItem, "person", queryClient, router);
+                  }}
+                  onPress={(item: any) => {
+                    const navItem = toDetailNavItem(item, "movie");
+                    if (navItem)
+                      openDetail(navItem, "person", {
+                        queryClient,
+                        router,
+                        nav,
+                      });
+                  }}
+                  variant="default"
+                />
+              ))}
+            </ScrollView>
+          </View>
+        )}
+
+        {/* Filmography — TV */}
+        {tvCredits.length > 0 && (
+          <View className="mb-8">
+            <Text
+              style={{
+                fontFamily: "PlayfairDisplay_700Bold",
+                fontSize: 18,
+                color: colors.textPrimary,
+                paddingHorizontal: 24,
+                marginBottom: 12,
+              }}
+            >
+              TV Shows
+            </Text>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={{ paddingHorizontal: 16, gap: 10 }}
+            >
+              {tvCredits.slice(0, 20).map((credit: any) => (
+                <MediaCard
+                  key={`t-${credit.id}`}
+                  item={
+                    {
+                      id: credit.id,
+                      name: credit.name || credit.title,
+                      poster_path: credit.poster_path,
+                      vote_average: credit.vote_average,
+                      media_type: "tv",
+                    } as any
+                  }
+                  onPressIn={(item: any) => {
+                    const navItem = toDetailNavItem(item, "tv");
+                    if (navItem)
+                      prepareDetail(navItem, "person", queryClient, router);
+                  }}
+                  onPress={(item: any) => {
+                    const navItem = toDetailNavItem(item, "tv");
+                    if (navItem)
+                      openDetail(navItem, "person", {
+                        queryClient,
+                        router,
+                        nav,
+                      });
+                  }}
+                  variant="default"
+                />
+              ))}
+            </ScrollView>
+          </View>
+        )}
+
+        <View style={{ height: 80 }} />
+      </ScrollView>
+    </View>
+  );
+}

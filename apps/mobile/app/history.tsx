@@ -1,0 +1,614 @@
+import React, { useState, useEffect, useCallback, useMemo } from "react";
+import {
+  View,
+  Text,
+  FlatList,
+  TouchableOpacity,
+  ActivityIndicator,
+  RefreshControl,
+  useWindowDimensions,
+  Alert,
+} from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { BackIcon, ForwardIcon } from "../components/Icons";
+import { Ionicons } from "@expo/vector-icons";
+import { useRouter, useFocusEffect } from "expo-router";
+import { useSafeNavigation } from "@/lib/navigation";
+import { useQueryClient } from "@tanstack/react-query";
+import { tmdbApi } from "../lib/api";
+import { MediaCard } from "../components/MediaCard";
+import { ProgressiveImage } from "../components/ProgressiveImage";
+import { clearAllProgress } from "../lib/watchHistory";
+import {
+  useWatchHistory,
+  watchHistoryStore,
+  type HistoryMode,
+} from "../lib/watchHistoryStore";
+import { getImageUrl } from "@filmsnaps/shared";
+import { tmdbToAnimeIds } from "../lib/anime/resolve";
+import { prepareDetail, toDetailNavItem } from "../lib/openDetail";
+import { beginIntentTap } from "../lib/perfMetrics";
+import { EmptyState } from "../components/EmptyState";
+import type { WatchProgress } from "../lib/watchHistory";
+
+import { colors } from "../theme/colors";
+
+const NUM_COLUMNS = 3;
+const GAP = 8;
+const PADDING = 16;
+
+function HistorySkeleton() {
+  const insets = useSafeAreaInsets();
+  return (
+    <View
+      style={{ flex: 1, backgroundColor: colors.bg, paddingTop: insets.top }}
+    >
+      <View
+        style={{
+          paddingHorizontal: 20,
+          paddingTop: 16,
+          paddingBottom: 8,
+          flexDirection: "row",
+          justifyContent: "space-between",
+        }}
+      >
+        <View
+          style={{
+            width: 80,
+            height: 22,
+            borderRadius: 4,
+            backgroundColor: colors.skeletonBg,
+          }}
+        />
+        <View
+          style={{
+            width: 48,
+            height: 20,
+            borderRadius: 4,
+            backgroundColor: colors.skeletonBg,
+          }}
+        />
+      </View>
+      {Array.from({ length: 5 }).map((_, i) => (
+        <View
+          key={i}
+          style={{
+            flexDirection: "row",
+            backgroundColor: colors.skeletonBgAlt,
+            borderRadius: 12,
+            marginHorizontal: 16,
+            marginBottom: 8,
+            overflow: "hidden",
+          }}
+        >
+          <View
+            style={{
+              width: 68,
+              height: 102,
+              backgroundColor: colors.skeletonBg,
+            }}
+          />
+          <View style={{ flex: 1, padding: 10, justifyContent: "center" }}>
+            <View
+              style={{
+                width: "70%",
+                height: 14,
+                borderRadius: 4,
+                backgroundColor: colors.skeletonBg,
+              }}
+            />
+            <View
+              style={{
+                width: "40%",
+                height: 10,
+                borderRadius: 4,
+                backgroundColor: colors.skeletonBg,
+                marginTop: 6,
+              }}
+            />
+            <View
+              style={{
+                width: "100%",
+                height: 4,
+                borderRadius: 2,
+                backgroundColor: colors.skeletonBg,
+                marginTop: 8,
+              }}
+            />
+            <View
+              style={{
+                flexDirection: "row",
+                justifyContent: "space-between",
+                marginTop: 8,
+              }}
+            >
+              <View
+                style={{
+                  width: 50,
+                  height: 10,
+                  borderRadius: 4,
+                  backgroundColor: colors.skeletonBg,
+                }}
+              />
+              <View
+                style={{
+                  width: 40,
+                  height: 10,
+                  borderRadius: 4,
+                  backgroundColor: colors.skeletonBg,
+                }}
+              />
+            </View>
+          </View>
+        </View>
+      ))}
+    </View>
+  );
+}
+
+export default function HistoryScreen() {
+  const nav = useSafeNavigation();
+  const router = useRouter();
+  const insets = useSafeAreaInsets();
+  const queryClient = useQueryClient();
+  const { width: SCREEN_WIDTH } = useWindowDimensions();
+
+  // Master archive: shows ALL modes by default with a segmented filter
+  // (All / Movies-TV / Anime). Filtering happens in the store selector.
+  const [filter, setFilter] = useState<HistoryMode>("all");
+
+  // Subscribe to the local-first singleton. It survives this route's unmount,
+  // so returning to /history never re-fetches or flashes a skeleton — the list
+  // is already resolved (stale-then-revalidate if a background refresh runs).
+  const { entries, isHydrated, isRefreshing } = useWatchHistory(filter);
+  const [displayCount, setDisplayCount] = useState(10);
+
+  // Reset the paging window whenever the filter changes so a shorter filtered
+  // list doesn't keep showing a stale "load more" slice.
+  useEffect(() => {
+    setDisplayCount(10);
+  }, [filter]);
+
+  // Keep progress fresh after returning from a watch session (the player saved
+  // new progress to AsyncStorage). Stale-then-revalidate: the list is already
+  // shown, the store just updates percent/completed in the background.
+  useFocusEffect(
+    useCallback(() => {
+      watchHistoryStore.syncProgress().catch(() => {});
+    }, []),
+  );
+
+  const itemWidth = useMemo(
+    () => (SCREEN_WIDTH - PADDING * 2 - GAP * (NUM_COLUMNS - 1)) / NUM_COLUMNS,
+    [SCREEN_WIDTH],
+  );
+
+  const handleRemoveItem = useCallback(
+    (item: WatchProgress) => {
+      const id = item.tmdbId;
+      const entry = entries.find((e) => e.latest.tmdbId === id);
+      const title =
+        entry?.meta != null
+          ? item.mediaType === "tv"
+            ? entry.meta.name
+            : entry.meta.title
+          : `ID: ${id}`;
+      Alert.alert(
+        "Remove from History",
+        `Remove "${title}" from your history?`,
+        [
+          { text: "Cancel", style: "cancel" },
+          {
+            text: "Remove",
+            style: "destructive",
+            onPress: () => {
+              watchHistoryStore
+                .removeItem(id, item.mediaType, item.isAnime)
+                .catch(() => {});
+            },
+          },
+        ],
+      );
+    },
+    [entries],
+  );
+
+  const handleItemPressIn = useCallback(
+    (p: WatchProgress) => {
+      prepareDetail(
+        toDetailNavItem(
+          {
+            id: p.tmdbId,
+            media_type: p.mediaType,
+            poster_path: null,
+          },
+          p.mediaType === "tv" ? "tv" : "movie",
+        )!,
+        "history",
+        queryClient,
+        router,
+      );
+    },
+    [queryClient, router],
+  );
+
+  const handleItemPress = useCallback(
+    (item: WatchProgress) => {
+      const id = item.tmdbId;
+      const isAnime = item.isAnime === true;
+      const base =
+        item.mediaType === "tv"
+          ? `/watch/tv/${id}/${item.season ?? 1}/${item.episode ?? 1}`
+          : `/watch/movie/${id}`;
+      const params = new URLSearchParams({});
+      if (isAnime) {
+        params.set("isAnime", "1");
+        const ids = tmdbToAnimeIds(
+          id,
+          item.mediaType,
+          item.season,
+          item.episode,
+        );
+        if (ids) {
+          params.set("mid", String(ids.malId));
+          if (ids.anilistId != null) params.set("aid", String(ids.anilistId));
+        }
+      }
+      const target = params.toString() ? `${base}?${params.toString()}` : base;
+
+      // [watchperf] intent mark for history → watch (same as details/CW).
+      const perfKey =
+        item.mediaType === "tv"
+          ? `tv:${id}:s${item.season ?? 1}e${item.episode ?? 1}`
+          : `movie:${id}`;
+      beginIntentTap(perfKey);
+
+      // History primary action opens the player (resume). Still warm the
+      // detail cache + images on touch-down so a later detail open is instant.
+      prepareDetail(
+        toDetailNavItem(
+          {
+            id,
+            media_type: item.mediaType,
+            poster_path: null,
+          },
+          item.mediaType === "tv" ? "tv" : "movie",
+        )!,
+        "history",
+        queryClient,
+        router,
+      );
+      nav.push(target);
+    },
+    [nav, router, queryClient],
+  );
+
+  const formatDate = (ts: number): string => {
+    const d = new Date(ts);
+    const now = new Date();
+    const diffMs = now.getTime() - d.getTime();
+    const diffMins = Math.floor(diffMs / 60000);
+    const diffHours = Math.floor(diffMs / 3600000);
+    const diffDays = Math.floor(diffMs / 86400000);
+
+    if (diffMins < 1) return "Just now";
+    if (diffMins < 60) return `${diffMins}m ago`;
+    if (diffHours < 24) return `${diffHours}h ago`;
+    if (diffDays < 7) return `${diffDays}d ago`;
+    return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  };
+
+  const progressLabel = (p: WatchProgress): string => {
+    if (p.completed) return "Completed";
+    const pct = Math.round(p.percent * 100);
+    if (pct < 5) return "Started";
+    return `${pct}%`;
+  };
+
+  if (!isHydrated) {
+    return <HistorySkeleton />;
+  }
+
+  return (
+    <View
+      className="flex-1 bg-void"
+      style={{ backgroundColor: colors.bg, paddingTop: insets.top }}
+    >
+      {/* Header */}
+      <View className="px-5 pt-4 pb-2 flex-row items-center justify-between">
+        <View className="flex-row items-center">
+          <TouchableOpacity
+            onPress={() => nav.goBack({ fallback: "/(tabs)" })}
+            className="w-9 h-9 rounded-full bg-zinc-800/60 items-center justify-center mr-3"
+            activeOpacity={0.7}
+          >
+            <BackIcon width={20} height={20} color={colors.textPrimary} />
+          </TouchableOpacity>
+          <Text
+            style={{
+              fontFamily: "PlayfairDisplay_700Bold",
+              fontSize: 22,
+              color: colors.textPrimary,
+            }}
+          >
+            History
+          </Text>
+        </View>
+      </View>
+
+      {/* ── Mode filter (All / Movies-TV / Anime) ── */}
+      <View className="px-5 pb-2">
+        <View
+          className="flex-row rounded-lg p-1"
+          style={{ backgroundColor: colors.bgSurface }}
+        >
+          {(
+            [
+              { key: "all", label: "All" },
+              { key: "movie_tv", label: "Movies-TV" },
+              { key: "anime", label: "Anime" },
+            ] as Array<{ key: HistoryMode; label: string }>
+          ).map(({ key, label }) => {
+            const active = filter === key;
+            return (
+              <TouchableOpacity
+                key={key}
+                onPress={() => setFilter(key)}
+                activeOpacity={0.7}
+                className="flex-1 items-center py-1.5 rounded-md"
+                style={{
+                  backgroundColor: active ? colors.gold : "transparent",
+                }}
+              >
+                <Text
+                  style={{
+                    fontFamily: "Inter_600SemiBold",
+                    fontSize: 12,
+                    color: active ? colors.bg : colors.textSecondary,
+                  }}
+                >
+                  {label}
+                </Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      </View>
+
+      {entries.length === 0 ? (
+        <EmptyState
+          icon="time-outline"
+          title="No history yet"
+          message="Movies and TV shows you watch will appear here."
+          actionLabel="Browse films"
+          onAction={() => nav.push("/")}
+        />
+      ) : (
+        <FlatList
+          data={entries.slice(0, displayCount)}
+          keyExtractor={(item) =>
+            `${item.latest.mediaType}:${item.latest.tmdbId}`
+          }
+          contentContainerStyle={{ padding: PADDING, paddingBottom: 100 }}
+          showsVerticalScrollIndicator={false}
+          onEndReached={() => {
+            if (displayCount < entries.length) {
+              setDisplayCount((prev) => prev + 10);
+            }
+          }}
+          onEndReachedThreshold={0.5}
+          refreshControl={
+            <RefreshControl
+              refreshing={isRefreshing}
+              onRefresh={() => {
+                watchHistoryStore.forceRefresh().catch(() => {});
+              }}
+              tintColor={colors.gold}
+              colors={[colors.gold]}
+            />
+          }
+          ListFooterComponent={
+            <>
+              {displayCount < entries.length ? (
+                <View className="self-center mt-4 mb-3 py-1">
+                  <ActivityIndicator size="small" color={colors.gold} />
+                </View>
+              ) : entries.length > 0 ? (
+                <View className="self-center mt-4 mb-3">
+                  <Text className="text-text-tertiary text-xs">
+                    All caught up — {entries.length} items
+                  </Text>
+                </View>
+              ) : null}
+              <TouchableOpacity
+                onPress={() => {
+                  Alert.alert(
+                    "Clear History",
+                    "This will remove all your watch history. This cannot be undone.",
+                    [
+                      { text: "Cancel", style: "cancel" },
+                      {
+                        text: "Clear All",
+                        style: "destructive",
+                        onPress: () =>
+                          clearAllProgress().then(() =>
+                            watchHistoryStore.syncProgress().catch(() => {}),
+                          ),
+                      },
+                    ],
+                  );
+                }}
+                activeOpacity={0.7}
+                className="self-center mb-8"
+              >
+                <View className="flex-row items-center">
+                  <Ionicons
+                    name="trash-outline"
+                    size={14}
+                    color={colors.error}
+                  />
+                  <Text className="text-red-400 text-xs ml-1.5">
+                    Clear History
+                  </Text>
+                </View>
+              </TouchableOpacity>
+            </>
+          }
+          ItemSeparatorComponent={() => <View style={{ height: 8 }} />}
+          renderItem={({ item }) => {
+            const p = item.latest;
+            const meta = item.meta;
+            const title =
+              (p.mediaType === "tv" ? meta?.name : meta?.title) ??
+              `ID: ${p.tmdbId}`;
+            const poster = meta?.poster_path;
+            const pct = p.completed ? 1 : p.percent;
+            const label = progressLabel(p);
+            const isFullyWatched = item.fullyWatched;
+
+            return (
+              <TouchableOpacity
+                onPress={() => handleItemPress(p)}
+                onPressIn={() => handleItemPressIn(p)}
+                activeOpacity={0.7}
+                className="flex-row bg-elevated rounded-xl overflow-hidden"
+                style={{ backgroundColor: colors.bgCard }}
+              >
+                {/* Per-item remove */}
+                <TouchableOpacity
+                  onPress={(e) => {
+                    e.stopPropagation();
+                    handleRemoveItem(p);
+                  }}
+                  hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                  activeOpacity={0.7}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Remove ${title} from history`}
+                  style={{
+                    position: "absolute",
+                    top: 6,
+                    right: 6,
+                    zIndex: 2,
+                    width: 24,
+                    height: 24,
+                    borderRadius: 12,
+                    backgroundColor: "rgba(0,0,0,0.6)",
+                    alignItems: "center",
+                    justifyContent: "center",
+                  }}
+                >
+                  <Ionicons name="close" size={14} color={colors.textPrimary} />
+                </TouchableOpacity>
+
+                {/* Poster */}
+                <View style={{ width: 68, height: 102 }}>
+                  {poster ? (
+                    <ProgressiveImage
+                      uri={getImageUrl(poster, "w342")}
+                      style={{ width: "100%", height: "100%" }}
+                      resizeMode="cover"
+                    />
+                  ) : (
+                    <View
+                      className="flex-1 items-center justify-center"
+                      style={{ backgroundColor: colors.bgTop }}
+                    >
+                      <Ionicons
+                        name={p.mediaType === "tv" ? "tv" : "film"}
+                        size={24}
+                        color={colors.iconMuted}
+                      />
+                    </View>
+                  )}
+                </View>
+
+                {/* Info */}
+                <View className="flex-1 px-3 py-2.5 justify-center">
+                  <Text
+                    className="text-text-primary text-sm font-bold leading-tight"
+                    numberOfLines={1}
+                  >
+                    {title}
+                  </Text>
+
+                  {/* TV episode subtitle */}
+                  {p.mediaType === "tv" &&
+                    p.season != null &&
+                    p.episode != null && (
+                      <Text className="text-text-tertiary text-xs mt-0.5">
+                        S{p.season}:E{p.episode}
+                        {item.episodeCount > 1 &&
+                          ` +${item.episodeCount - 1} more`}
+                      </Text>
+                    )}
+
+                  {isFullyWatched ? (
+                    <View className="bg-green-900/40 rounded-sm px-1.5 py-0.5 self-start">
+                      <Text className="text-green-400 text-[9px] font-bold">
+                        COMPLETED
+                      </Text>
+                    </View>
+                  ) : null}
+
+                  {/* Progress bar */}
+                  <View
+                    className="h-1 rounded-full mt-2 overflow-hidden"
+                    style={{ backgroundColor: colors.progressTrack }}
+                  >
+                    <View
+                      className="h-full rounded-full"
+                      style={{
+                        width: `${Math.round(pct * 100)}%`,
+                        backgroundColor: isFullyWatched
+                          ? colors.successGreen
+                          : colors.gold,
+                      }}
+                    />
+                  </View>
+
+                  {/* Bottom row: label + date */}
+                  <View className="flex-row items-center justify-between mt-1.5">
+                    <View className="flex-row items-center gap-1">
+                      {isFullyWatched ? (
+                        <Ionicons
+                          name="checkmark-circle"
+                          size={12}
+                          color={colors.successGreen}
+                        />
+                      ) : p.completed ? (
+                        <Ionicons
+                          name="checkmark-circle"
+                          size={12}
+                          color={colors.gold}
+                        />
+                      ) : (
+                        <Ionicons name="play" size={10} color={colors.gold} />
+                      )}
+                      <Text
+                        className={`text-xs font-semibold ${isFullyWatched ? "text-green-500" : "text-primary"}`}
+                      >
+                        {isFullyWatched ? "Complete" : label}
+                      </Text>
+                    </View>
+                    <Text className="text-text-tertiary text-[10px]">
+                      {formatDate(p.updatedAt)}
+                    </Text>
+                  </View>
+                </View>
+
+                {/* Chevron */}
+                <View className="justify-center pr-3">
+                  <ForwardIcon
+                    width={16}
+                    height={16}
+                    color={colors.iconMuted}
+                  />
+                </View>
+              </TouchableOpacity>
+            );
+          }}
+        />
+      )}
+    </View>
+  );
+}

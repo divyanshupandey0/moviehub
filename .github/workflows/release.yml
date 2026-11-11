@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.10.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build shared package
+        run: cd packages/shared && pnpm build
+
+      - name: Build web app
+        run: cd apps/web && pnpm build
+        env:
+          NEXT_PUBLIC_TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+
+      - name: Upload web build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-build
+          path: apps/web/.next/
+          retention-days: 1
+
+      - name: Build web for Cloudflare
+        run: cd apps/web && pnpm cf:build
+
+      - name: Upload Cloudflare build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudflare-build
+          path: apps/web/.open-next/
+          retention-days: 1
+
+  create-release:
+    needs: [build-web]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download web build
+        uses: actions/download-artifact@v4
+        with:
+          name: web-build
+          path: web-build
+
+      - name: Download Cloudflare build
+        uses: actions/download-artifact@v4
+        with:
+          name: cloudflare-build
+          path: cloudflare-build
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            web-build/**/*
+            cloudflare-build/**/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

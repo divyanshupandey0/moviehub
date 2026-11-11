@@ -1,0 +1,1527 @@
+import React, {
+  useCallback,
+  useMemo,
+  useRef,
+  useState,
+  useEffect,
+} from "react";
+import {
+  View,
+  ScrollView,
+  RefreshControl,
+  Text,
+  ActivityIndicator,
+  useWindowDimensions,
+  TouchableOpacity,
+  Image,
+} from "react-native";
+import Animated, {
+  FadeInDown,
+  FadeOutUp,
+  LinearTransition,
+} from "react-native-reanimated";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { useSafeNavigation } from "@/lib/navigation";
+import { Ionicons } from "@expo/vector-icons";
+import { useQueryClient } from "@tanstack/react-query";
+import { Hero } from "../../components/Hero";
+import { MediaCarousel } from "../../components/MediaCarousel";
+import { ProgressiveImage } from "../../components/ProgressiveImage";
+import { Shimmer } from "../../components/Shimmer";
+import { SeeAllButton } from "../../components/SeeAllButton";
+import { DeferredContent } from "../../components/DeferredContent";
+import { prefetchStreams } from "../../lib/streamPrefetch";
+import { resolvePlaybackProviderId } from "../../lib/resolvePlaybackProvider";
+import { getNextEpisode } from "../../lib/tvUtils";
+import {
+  useTrendingMovies,
+  useTrendingTV,
+  usePopularMovies,
+  useMoreLikeThis,
+  useTop10MoviesToday,
+  useRecentAddedMovies,
+  useRecentAddedTV,
+  useLatestIndianMovies,
+} from "../../hooks/useTMDB";
+import { Top10Carousel } from "../../components/Top10Carousel";
+import { IndianMoviesSection } from "../../components/IndianMoviesSection";
+import { useSlotImpression } from "../../hooks/useSlotImpression";
+import { AdSlot } from "../../lib/ads";
+import { tmdbApi } from "../../lib/api";
+import { useDownloadList } from "../../lib/download";
+import {
+  useWatchHistory,
+  watchHistoryStore,
+  getHistoryHint,
+} from "../../lib/watchHistoryStore";
+import {
+  markContentReady,
+  runAfterContentReady,
+} from "../../lib/runAfterContentReady";
+import {
+  launchNow,
+  markLaunch,
+  logLaunchSummary,
+} from "../../lib/launchMetrics";
+import { heroHeightForWidth } from "../../components/heroLayout";
+import { getImageUrl } from "@filmsnaps/shared";
+import { useNuvioPlugins, ALL_NUVIO_PLUGINS_ID } from "../../lib/nuvio";
+import { useFocusEffect } from "expo-router";
+import type { Movie } from "@filmsnaps/shared";
+import type { WatchProgress } from "../../lib/watchHistory";
+import type { Announcement } from "../../lib/announcements";
+import {
+  fetchAnnouncements,
+  dismissAnnouncement,
+} from "../../lib/announcements";
+import { AnnouncementBanner } from "../../components/AnnouncementBanner";
+import {
+  openDetail,
+  prepareDetail,
+  toDetailNavItem,
+} from "../../lib/openDetail";
+import {
+  filterReleasedTV,
+  filterAndSortRecentTV,
+  getTodayDateString,
+} from "../../lib/tmdb";
+import { beginIntentTap } from "../../lib/perfMetrics";
+import {
+  trackFeatureUsed,
+  trackDetailViewed,
+  getSessionId,
+  type DwellingSecondsBucket,
+} from "../../lib/telemetry";
+import { bucketDwellingSeconds } from "../../lib/telemetry/types";
+
+import { useRouter } from "expo-router";
+import NetInfo from "@react-native-community/netinfo";
+import { useSettings } from "../../lib/settings";
+import { useAniListHome } from "../../lib/anime/home";
+import type { AniListMedia } from "../../lib/anime/home";
+import { lookupMal, tmdbToAnimeIds } from "../../lib/anime/resolve";
+import { colors } from "../../theme/colors";
+import { typography } from "../../theme/typography";
+import { SwipeExemptScrollView } from "../../components/SwipeExemptScroll";
+
+const SKELETON_ITEMS = 3;
+
+/** Fixed CW row slot (header + one card row + section margin). */
+const CW_RESERVED_HEIGHT = 236;
+
+// ── Static fallback label map; live plugin labels added inside HomeScreen ──
+const DEFAULT_PROVIDER_LABELS: Record<string, string> = {
+  [ALL_NUVIO_PLUGINS_ID]: "Nuvio",
+};
+
+const SECTION_CONFIG: Record<string, { label: string }> = {
+  "top-10-movies": { label: "Top 10 Movies – Global Today" },
+  "latest-indian-movies": { label: "Latest Indian Movies" },
+  "recent-movies": { label: "Recent Added Movies" },
+  "recent-tv": { label: "Recent Added TV Shows" },
+  "trending-movies": { label: "Trending Movies" },
+  "trending-tv": { label: "Trending TV" },
+  "more-like-this": { label: "More Like This" },
+  "continue-watching": { label: "Continue Watching" },
+  "popular-movies": { label: "Popular Movies" },
+};
+
+export default function HomeScreen() {
+  const nav = useSafeNavigation();
+  const router = useRouter();
+  const { plugins } = useNuvioPlugins();
+  const PROVIDER_LABELS = React.useMemo(() => {
+    const map: Record<string, string> = { ...DEFAULT_PROVIDER_LABELS };
+    for (const p of plugins) {
+      map[p.id] = p.name;
+      map[p.pluginKey] = p.name;
+    }
+    return map;
+  }, [plugins]);
+  const insets = useSafeAreaInsets();
+  const queryClient = useQueryClient();
+  const { width: SCREEN_WIDTH } = useWindowDimensions();
+  const refreshing = useRef(false);
+
+  // M1 — impression measurement: candidate ad slot under the hero.
+  useSlotImpression("home_hero", "home");
+
+  const {
+    data: trendingMovies,
+    refetch: refetchMovies,
+    isLoading: loadingMovies,
+  } = useTrendingMovies();
+  const {
+    data: trendingTV,
+    refetch: refetchTV,
+    isLoading: loadingTV,
+  } = useTrendingTV();
+  const {
+    data: popularMovies,
+    refetch: refetchPopular,
+    isLoading: loadingPopular,
+  } = usePopularMovies();
+  const {
+    data: top10Movies,
+    refetch: refetchTop10,
+    isLoading: loadingTop10,
+  } = useTop10MoviesToday();
+  const {
+    data: recentMovies,
+    refetch: refetchRecentMovies,
+    isLoading: loadingRecentMovies,
+  } = useRecentAddedMovies();
+  const {
+    data: recentTV,
+    refetch: refetchRecentTV,
+    isLoading: loadingRecentTV,
+  } = useRecentAddedTV();
+  const {
+    data: indianMoviesData,
+    refetch: refetchIndianMovies,
+    isLoading: loadingIndianMovies,
+  } = useLatestIndianMovies("all");
+
+  const todayStr = useMemo(() => getTodayDateString(), []);
+
+  const verifiedRecentMovies = useMemo(() => {
+    if (!recentMovies?.results || !Array.isArray(recentMovies.results))
+      return [];
+    const seen = new Set<number>();
+    const list: Movie[] = [];
+    for (const m of recentMovies.results) {
+      if (!m || !m.id || !m.poster_path) continue;
+      const relDate = m.release_date;
+      if (!relDate || typeof relDate !== "string" || relDate.length < 10)
+        continue;
+      const cleanDate = relDate.slice(0, 10);
+      if (cleanDate > todayStr) continue; // Strictly exclude future releases
+
+      if (!seen.has(m.id)) {
+        seen.add(m.id);
+        list.push({
+          ...m,
+          release_date: cleanDate,
+        });
+      }
+    }
+    return list.sort((a, b) => {
+      const dateA = a.release_date || "";
+      const dateB = b.release_date || "";
+      return dateB.localeCompare(dateA);
+    });
+  }, [recentMovies?.results, todayStr]);
+
+  const verifiedRecentTV = useMemo(() => {
+    if (!recentTV?.results || !Array.isArray(recentTV.results)) return [];
+    return filterAndSortRecentTV(recentTV.results, todayStr);
+  }, [recentTV?.results, todayStr]);
+
+  const verifiedTrendingTV = useMemo(() => {
+    if (!trendingTV?.results || !Array.isArray(trendingTV.results)) return [];
+    return filterReleasedTV(trendingTV.results, todayStr);
+  }, [trendingTV?.results, todayStr]);
+
+  // ── FIX 1: single content-ready signal (all three home queries settled) ──
+  const contentReadyRef = useRef(false);
+  useEffect(() => {
+    if (loadingMovies || loadingTV || loadingPopular) return;
+    if (contentReadyRef.current) return;
+    contentReadyRef.current = true;
+    markContentReady();
+    markLaunch("homeContentReadyMs", launchNow());
+    logLaunchSummary();
+  }, [loadingMovies, loadingTV, loadingPopular]);
+
+  // ── Settings (hoisted above history subscription which reads `settings.mode`) ──
+  const { settings, updateSetting, loaded: settingsLoaded } = useSettings();
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+
+  // ── History — subscribe to the local-first singleton (no local load state). ──
+  const { entries: storeHistory, isHydrated: historyHydrated } =
+    useWatchHistory(settings.mode === "anime" ? "anime" : "movie_tv");
+  const historyEntries = useMemo(
+    () => storeHistory.slice(0, 6),
+    [storeHistory],
+  );
+  const historyMeta = useMemo(() => {
+    const m: Record<string, Movie | null> = {};
+    for (const e of storeHistory) m[e.latest.tmdbId] = e.meta;
+    return m;
+  }, [storeHistory]);
+
+  // ── Announcements (inline card under hero — cache-first at first paint) ──
+  const [announcements, setAnnouncements] = useState<Announcement[]>([]);
+  const announcementsFetchedRef = useRef(false);
+
+  // FIX E: cached non-dismissed announcements paint immediately (no wait).
+  useEffect(() => {
+    if (announcementsFetchedRef.current) return;
+    announcementsFetchedRef.current = true;
+
+    // Ensure legacy welcome banner is permanently dismissed from storage
+    dismissAnnouncement("welcome-to-filmsnaps").catch(() => {});
+
+    fetchAnnouncements()
+      .then((result) => {
+        const clean = result.filter(
+          (a) =>
+            a.id !== "welcome-to-filmsnaps" &&
+            !a.title?.toLowerCase().includes("welcome to filmsnaps"),
+        );
+        if (clean.length > 0) setAnnouncements(clean);
+      })
+      .catch(() => {});
+  }, []);
+
+  // ── Offline detection ──
+  const [isOffline, setIsOffline] = useState(false);
+  useEffect(() => {
+    const unsub = NetInfo.addEventListener((s) => {
+      setIsOffline(!s.isConnected && !s.isInternetReachable);
+    });
+    return () => unsub();
+  }, []);
+
+  // ── Continue-watching stream pipeline ──
+  // Once the history hydrates, quietly run the stream pipeline (fetch →
+  // rank → probe the champion) for the first two CW titles so tapping a card
+  // reaches the player pre-warmed. Delayed and session-once so it never
+  // competes with app-startup work.
+  //
+  // The timer must NOT be cleared when storeHistory re-emits: hydration is
+  // followed by TMDB enrichment within seconds, and that dep-change cleanup
+  // used to cancel the pending timer while the session-once ref blocked a
+  // re-arm — so the prefetch never ran at all. Latest entries are read
+  // through a ref when the timer fires; only unmount clears the timer.
+  const cwPrefetchedRef = useRef(false);
+  const cwScheduledRef = useRef(false);
+  const cwHistoryRef = useRef(storeHistory);
+  cwHistoryRef.current = storeHistory;
+  useEffect(() => {
+    if (
+      cwPrefetchedRef.current ||
+      cwScheduledRef.current ||
+      !settingsLoaded ||
+      storeHistory.length === 0
+    )
+      return;
+    // FIX 1: CW stream prefetch only after content ready + 2s.
+    cwScheduledRef.current = true;
+    runAfterContentReady(2000, () => {
+      if (cwPrefetchedRef.current) return;
+      cwPrefetchedRef.current = true;
+      for (const entry of cwHistoryRef.current.slice(0, 2)) {
+        const p = entry.latest;
+        const tmdbIdNum = parseInt(p.tmdbId);
+        if (Number.isNaN(tmdbIdNum)) continue;
+        const prefetch = (season?: number, episode?: number) => {
+          // FIX 1: CW must pass the same provider id watch will open with.
+          void resolvePlaybackProviderId({
+            mediaType: p.mediaType,
+            tmdbId: tmdbIdNum,
+            savedServer: settingsRef.current.defaultServer,
+          })
+            .then((providerId) => {
+              if (!providerId) return;
+              return prefetchStreams(tmdbIdNum, p.mediaType, season, episode, {
+                cellularMaxMB: settingsRef.current.cellularMaxMB,
+                maxQuality: settingsRef.current.maxQuality,
+                preferredAudioLanguage:
+                  settingsRef.current.preferredAudioLanguage,
+                providerId,
+                trigger: "home-cw",
+              });
+            })
+            .catch(() => {});
+        };
+        // Finished the latest episode? Warm the NEXT one — that's what the
+        // user will actually play from this card (season rollover aware).
+        // Fully-watched titles stay in CW for exactly this reason.
+        if (
+          entry.fullyWatched &&
+          p.mediaType === "tv" &&
+          p.season &&
+          p.episode
+        ) {
+          getNextEpisode(p.tmdbId, p.season, p.episode)
+            .then(({ nextSeason, nextEpisode, hasNext }) => {
+              if (hasNext) prefetch(nextSeason, nextEpisode);
+            })
+            .catch(() => {});
+        } else {
+          prefetch(p.season, p.episode);
+        }
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storeHistory, settingsLoaded]);
+
+  // More Like This — genre-based recommendations from last-watched item
+  const { data: moreLikeThis } = useMoreLikeThis(historyEntries);
+
+  // Curate Dynamic Hero Banner: strictly newest verified Indian movie releases
+  const heroItem = useMemo(() => {
+    const list = indianMoviesData?.results ?? [];
+    // Prioritize newest officially released Indian movie with backdrop and overview
+    const curated = list.find(
+      (m: Movie) =>
+        m &&
+        m.id &&
+        m.backdrop_path &&
+        m.overview &&
+        m.release_date &&
+        m.release_date <= todayStr,
+    );
+    const fallback = list.find(
+      (m: Movie) =>
+        m &&
+        m.id &&
+        m.backdrop_path &&
+        m.release_date &&
+        m.release_date <= todayStr,
+    );
+    return curated ?? fallback ?? list[0];
+  }, [indianMoviesData?.results, todayStr]);
+
+  // ── Skeleton card dimensions (matches MediaCarousel) ──
+  const itemWidth = useMemo(() => (SCREEN_WIDTH - 48) / 3, [SCREEN_WIDTH]);
+  const itemHeight = useMemo(() => itemWidth * 1.5, [itemWidth]);
+
+  // ── Pull-to-refresh ──
+  const [isRefreshing, setIsRefreshing] = useState(false);
+
+  const { active: activeDownloads, completed: completedDownloads } =
+    useDownloadList();
+
+  // ── Scroll padding (useMemo instead of useRef so it updates reactively) ──
+  const bannerHeight = 48;
+  const tabBarHeight = 72;
+  const bottomPadding = Math.max(insets.bottom, 8);
+  const scrollPaddingStyle = useMemo(
+    () => ({
+      paddingBottom:
+        activeDownloads.length > 0
+          ? tabBarHeight + bannerHeight + 16 + bottomPadding
+          : tabBarHeight + 16 + bottomPadding,
+    }),
+    [activeDownloads.length, bottomPadding],
+  );
+
+  // Keep the store's progress in sync after returning from a watch session
+  // (the player saved new progress to AsyncStorage). Fire-and-forget; the store
+  // re-reads local progress and enriches any missing metadata in the background.
+  useFocusEffect(
+    useCallback(() => {
+      watchHistoryStore.syncProgress().catch(() => {});
+    }, []),
+  );
+
+  const handleDismissAnnouncement = useCallback((id: string) => {
+    dismissAnnouncement(id).catch(() => {});
+    setAnnouncements((prev) => prev.filter((a) => a.id !== id));
+  }, []);
+
+  const onRefresh = useCallback(async () => {
+    if (refreshing.current) return;
+    refreshing.current = true;
+    setIsRefreshing(true);
+
+    // Wait for actual completion instead of a hardcoded timeout
+    await Promise.allSettled([
+      refetchMovies(),
+      refetchTV(),
+      refetchPopular(),
+      refetchTop10(),
+      refetchRecentMovies(),
+      refetchRecentTV(),
+      refetchIndianMovies(),
+      queryClient.invalidateQueries({ queryKey: ["movies", "latest-indian"] }),
+      watchHistoryStore.forceRefresh(),
+    ]);
+
+    // Also refresh announcements in background
+    try {
+      const fresh = await fetchAnnouncements({ force: true });
+      const clean = fresh.filter(
+        (a) =>
+          a.id !== "welcome-to-filmsnaps" &&
+          !a.title?.toLowerCase().includes("welcome to filmsnaps"),
+      );
+      setAnnouncements(clean);
+    } catch {}
+
+    setIsRefreshing(false);
+    refreshing.current = false;
+  }, [refetchMovies, refetchTV, refetchPopular]);
+
+  // ── Remove a single Continue Watching item (mutates the shared store) ──
+  const handleRemoveHistoryItem = useCallback(
+    (tmdbId: string, mediaType: "movie" | "tv") => {
+      watchHistoryStore.removeItem(tmdbId, mediaType).catch(() => {});
+    },
+    [],
+  );
+
+  // ── Navigation ──
+  const handleSeeAllTrendingMovies = useCallback(() => {
+    nav.push("/list/trending-movies");
+  }, [nav]);
+
+  const handleSeeAllTrendingTV = useCallback(() => {
+    nav.push("/list/trending-tv");
+  }, [nav]);
+
+  const handleSeeAllPopularMovies = useCallback(() => {
+    nav.push("/list/popular-movies");
+  }, [nav]);
+
+  // Detail viewed tracking — fires when user taps a card (dwelling starts).
+  // The actual dwelling time is measured on the detail page, but we track
+  // the click here with fromTab="home".
+  const handleMoviePressIn = useCallback(
+    (item: Movie) => {
+      const navItem = toDetailNavItem(item);
+      if (navItem) {
+        prepareDetail(navItem, "home", queryClient, router);
+        // Track detail view intent (dwelling measured on detail page).
+        trackDetailViewed({
+          sessionId: getSessionId(),
+          screen: navItem.mediaType === "tv" ? "detail_tv" : "detail_movie",
+          tmdbId: item.id,
+          mediaType: navItem.mediaType === "tv" ? "tv" : "movie",
+          fromTab: "home",
+          dwellingSecondsBucket: "<3", // will be updated on detail page if they stay
+        });
+      }
+    },
+    [queryClient, router],
+  );
+
+  const handleMoviePress = useCallback(
+    (item: Movie) => {
+      const navItem = toDetailNavItem(item);
+      if (!navItem) return;
+      openDetail(navItem, "home", { queryClient, router, nav });
+    },
+    [nav, router, queryClient],
+  );
+
+  const handleWatchPress = useCallback(
+    (item: Movie) => {
+      const navItem = toDetailNavItem(item);
+      const mediaType = navItem?.mediaType === "tv" ? "tv" : "movie";
+      beginIntentTap(`${mediaType}:${item.id}`);
+      nav.push(`/watch/${mediaType}/${item.id}`);
+    },
+    [nav],
+  );
+
+  // ── Memoised section ordering ──
+  // Render exactly the sections the user has in their homeRowOrder, in that
+  // order. Sections removed from the layout no longer render (previously they
+  // were sorted to the bottom with `?? 999` and still appeared). Unknown IDs
+  // in the stored order are ignored.
+  const orderedSections = useMemo(() => {
+    return settings.homeRowOrder.filter((id) =>
+      Object.prototype.hasOwnProperty.call(SECTION_CONFIG, id),
+    );
+  }, [settings.homeRowOrder]);
+
+  // ── Render each section ──
+  const renderSection = useCallback(
+    (id: string) => {
+      switch (id) {
+        case "top-10-movies":
+          return top10Movies?.results ? (
+            <Top10Carousel
+              title={SECTION_CONFIG["top-10-movies"].label}
+              data={top10Movies.results}
+              onItemPress={handleMoviePress}
+              onItemPressIn={handleMoviePressIn}
+            />
+          ) : (
+            <View className="mb-6 px-4">
+              <Shimmer
+                width={180}
+                height={20}
+                borderRadius={4}
+                style={{ marginBottom: 12 }}
+              />
+              <View className="flex-row" style={{ gap: 10 }}>
+                {Array.from({ length: SKELETON_ITEMS }).map((_, i) => (
+                  <Shimmer
+                    key={i}
+                    width={itemWidth}
+                    height={itemHeight}
+                    borderRadius={12}
+                  />
+                ))}
+              </View>
+            </View>
+          );
+
+        case "latest-indian-movies":
+          return (
+            <IndianMoviesSection
+              title={SECTION_CONFIG["latest-indian-movies"].label}
+              onItemPress={handleMoviePress}
+              onItemPressIn={handleMoviePressIn}
+            />
+          );
+
+        case "recent-movies":
+          return verifiedRecentMovies.length > 0 ? (
+            <MediaCarousel
+              title={SECTION_CONFIG["recent-movies"].label}
+              data={verifiedRecentMovies}
+              onItemPress={handleMoviePress}
+              onItemPressIn={handleMoviePressIn}
+              showDateBadge
+            />
+          ) : loadingRecentMovies ? (
+            <View className="mb-6 px-4">
+              <Shimmer
+                width={160}
+                height={20}
+                borderRadius={4}
+                style={{ marginBottom: 12 }}
+              />
+              <View className="flex-row" style={{ gap: 10 }}>
+                {Array.from({ length: SKELETON_ITEMS }).map((_, i) => (
+                  <Shimmer
+                    key={i}
+                    width={itemWidth}
+                    height={itemHeight}
+                    borderRadius={12}
+                  />
+                ))}
+              </View>
+            </View>
+          ) : null;
+
+        case "recent-tv":
+          return verifiedRecentTV.length > 0 ? (
+            <MediaCarousel
+              title={SECTION_CONFIG["recent-tv"].label}
+              data={verifiedRecentTV}
+              onItemPress={handleMoviePress}
+              onItemPressIn={handleMoviePressIn}
+              showDateBadge
+            />
+          ) : loadingRecentTV ? (
+            <View className="mb-6 px-4">
+              <Shimmer
+                width={160}
+                height={20}
+                borderRadius={4}
+                style={{ marginBottom: 12 }}
+              />
+              <View className="flex-row" style={{ gap: 10 }}>
+                {Array.from({ length: SKELETON_ITEMS }).map((_, i) => (
+                  <Shimmer
+                    key={i}
+                    width={itemWidth}
+                    height={itemHeight}
+                    borderRadius={12}
+                  />
+                ))}
+              </View>
+            </View>
+          ) : null;
+
+        case "trending-movies":
+          return trendingMovies ? (
+            <MediaCarousel
+              title={SECTION_CONFIG["trending-movies"].label}
+              data={trendingMovies.results ?? []}
+              onItemPress={handleMoviePress}
+              onItemPressIn={handleMoviePressIn}
+              onSeeAll={handleSeeAllTrendingMovies}
+            />
+          ) : (
+            <View className="mb-6 px-4">
+              <Shimmer
+                width={144}
+                height={20}
+                borderRadius={4}
+                style={{ marginBottom: 12 }}
+              />
+              <View className="flex-row" style={{ gap: 10 }}>
+                {Array.from({ length: SKELETON_ITEMS }).map((_, i) => (
+                  <Shimmer
+                    key={i}
+                    width={itemWidth}
+                    height={itemHeight}
+                    borderRadius={12}
+                  />
+                ))}
+              </View>
+            </View>
+          );
+
+        case "trending-tv":
+          return verifiedTrendingTV.length > 0 ? (
+            <MediaCarousel
+              title={SECTION_CONFIG["trending-tv"].label}
+              data={verifiedTrendingTV}
+              onItemPress={handleMoviePress}
+              onItemPressIn={handleMoviePressIn}
+              onSeeAll={handleSeeAllTrendingTV}
+            />
+          ) : loadingTV ? (
+            <View className="mb-6 px-4">
+              <Shimmer
+                width={144}
+                height={20}
+                borderRadius={4}
+                style={{ marginBottom: 12 }}
+              />
+              <View className="flex-row" style={{ gap: 10 }}>
+                {Array.from({ length: SKELETON_ITEMS }).map((_, i) => (
+                  <Shimmer
+                    key={i}
+                    width={itemWidth}
+                    height={itemHeight}
+                    borderRadius={12}
+                  />
+                ))}
+              </View>
+            </View>
+          ) : null;
+
+        case "more-like-this":
+          return (moreLikeThis?.length ?? 0) > 0 ? (
+            <DeferredContent fallback={null} delayMs={200}>
+              <MediaCarousel
+                title={SECTION_CONFIG["more-like-this"].label}
+                data={moreLikeThis ?? []}
+                onItemPress={handleMoviePress}
+                onItemPressIn={handleMoviePressIn}
+              />
+            </DeferredContent>
+          ) : null;
+
+        case "continue-watching":
+          if (historyEntries.length > 0) {
+            return (
+              <ContinueWatchingSection
+                historyEntries={historyEntries}
+                historyMeta={historyMeta}
+                nav={nav}
+                SCREEN_WIDTH={SCREEN_WIDTH}
+                providerLabelMap={PROVIDER_LABELS}
+                onRemoveItem={handleRemoveHistoryItem}
+              />
+            );
+          }
+          if (!historyHydrated && getHistoryHint() === true) {
+            return (
+              <View
+                style={{ height: CW_RESERVED_HEIGHT }}
+                accessibilityLabel="Continue watching loading"
+              />
+            );
+          }
+          return null;
+
+        case "popular-movies":
+          // FIX F: no DeferredContent delay — home already gates on all 3 queries.
+          return popularMovies ? (
+            <MediaCarousel
+              title={SECTION_CONFIG["popular-movies"].label}
+              data={popularMovies.results ?? []}
+              onItemPress={handleMoviePress}
+              onItemPressIn={handleMoviePressIn}
+              onSeeAll={handleSeeAllPopularMovies}
+            />
+          ) : (
+            <View className="mb-6 px-4">
+              <Shimmer
+                width={144}
+                height={20}
+                borderRadius={4}
+                style={{ marginBottom: 12 }}
+              />
+              <View className="flex-row" style={{ gap: 10 }}>
+                {Array.from({ length: SKELETON_ITEMS }).map((_, i) => (
+                  <Shimmer
+                    key={i}
+                    width={itemWidth}
+                    height={itemHeight}
+                    borderRadius={12}
+                  />
+                ))}
+              </View>
+            </View>
+          );
+
+        default:
+          return null;
+      }
+    },
+    [
+      top10Movies,
+      verifiedRecentMovies,
+      verifiedRecentTV,
+      loadingRecentMovies,
+      loadingRecentTV,
+      trendingMovies,
+      trendingTV,
+      popularMovies,
+      moreLikeThis,
+      historyEntries,
+      historyMeta,
+      handleMoviePress,
+      handleSeeAllTrendingMovies,
+      handleSeeAllTrendingTV,
+      handleSeeAllPopularMovies,
+      nav,
+      SCREEN_WIDTH,
+      itemWidth,
+      itemHeight,
+      historyHydrated,
+    ],
+  );
+
+  // ── Skeleton (full-screen on first load) ──
+  // Gated on settingsLoaded too: the home row ORDER is restored from
+  // AsyncStorage asynchronously, so without this the sections would first
+  // paint in the default (trending-first) order and then swap to the user's
+  // saved order (e.g. Continue Watching on top) — a visible flicker. Holding
+  // the skeleton until settings are hydrated guarantees the first visible
+  // frame is already in the correct order.
+  if (!settingsLoaded || (loadingMovies && loadingTV && loadingPopular)) {
+    return (
+      <View
+        className="flex-1 bg-void"
+        style={{ paddingTop: insets.top, backgroundColor: colors.bg }}
+      >
+        {/* Hero skeleton — same aspect as real Hero (HERO_ASPECT_RATIO) */}
+        <View
+          style={{
+            width: SCREEN_WIDTH,
+            height: heroHeightForWidth(SCREEN_WIDTH),
+            backgroundColor: colors.skeletonBgAlt,
+          }}
+        />
+        {/* Sections skeleton */}
+        {[1, 2].map((s) => (
+          <View key={s} className="mb-6 px-4 mt-4">
+            <Shimmer
+              width={144}
+              height={20}
+              borderRadius={4}
+              style={{ marginBottom: 12 }}
+            />
+            <View className="flex-row mt-3" style={{ gap: 10 }}>
+              {Array.from({ length: SKELETON_ITEMS }).map((_, i) => (
+                <Shimmer
+                  key={i}
+                  width={itemWidth}
+                  height={itemHeight}
+                  borderRadius={12}
+                />
+              ))}
+            </View>
+          </View>
+        ))}
+      </View>
+    );
+  }
+
+  return (
+    <View
+      className="flex-1 bg-void"
+      style={{ paddingTop: insets.top, backgroundColor: colors.bg }}
+      onLayout={() => {
+        markLaunch("homeFirstFrameMs", launchNow());
+        logLaunchSummary();
+      }}
+    >
+      <ScrollView
+        refreshControl={
+          <RefreshControl
+            refreshing={isRefreshing}
+            onRefresh={onRefresh}
+            tintColor={colors.gold}
+            colors={[colors.gold]}
+          />
+        }
+        className="flex-1"
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={scrollPaddingStyle}
+      >
+        {/* ── Header with navigation affordances ── */}
+        <View className="px-5 py-4 flex-row items-center justify-between">
+          <View className="flex-row items-center">
+            <Image
+              source={require("../../assets/icon-128.webp")}
+              style={{ width: 36, height: 36, borderRadius: 12 }}
+              accessibilityLabel="MOVIE HUB logo"
+            />
+            <View className="ml-3">
+              <Text
+                style={{
+                  fontFamily: "PlayfairDisplay_700Bold",
+                  fontSize: 20,
+                  color: colors.gold,
+                }}
+              >
+                MOVIE HUB
+              </Text>
+            </View>
+          </View>
+
+          {/* Right: Actions */}
+          <View className="flex-row items-center" style={{ gap: 12 }}>
+            {/* Hard Mode Split luxury segmented toggle */}
+            <View
+              className="flex-row rounded-full p-0.5 border"
+              style={{
+                backgroundColor: "rgba(14, 14, 17, 0.85)",
+                borderColor: colors.borderSubtle,
+                pointerEvents: "auto",
+              }}
+            >
+              {(["movie_tv", "anime"] as const).map((m) => {
+                const active = settings.mode === m;
+                return (
+                  <TouchableOpacity
+                    key={m}
+                    onPress={() => {
+                      updateSetting("mode", m);
+                      trackFeatureUsed(
+                        m === "anime"
+                          ? "mode_toggle_anime"
+                          : "mode_toggle_movie_tv",
+                        "settings",
+                      );
+                    }}
+                    className="px-3 h-7 rounded-full items-center justify-center"
+                    style={{
+                      backgroundColor: active ? colors.gold : "transparent",
+                    }}
+                    activeOpacity={0.7}
+                  >
+                    <Text
+                      className="text-[11px] font-bold"
+                      style={{
+                        color: active ? colors.bg : colors.textSecondary,
+                        fontFamily: "Inter_600SemiBold",
+                      }}
+                    >
+                      {m === "anime" ? "Anime" : "Movies"}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          </View>
+        </View>
+
+        {/* ── Offline Hero Rail ── */}
+        {isOffline ? (
+          <View className="mb-6 px-4">
+            <View
+              style={{
+                borderRadius: 16,
+                backgroundColor: "rgba(251,191,36,0.08)",
+                borderWidth: 1,
+                borderColor: "rgba(251,191,36,0.2)",
+                padding: 20,
+                marginBottom: 16,
+              }}
+            >
+              <View className="flex-row items-center mb-1">
+                <Ionicons
+                  name="cloud-offline-outline"
+                  size={18}
+                  color={colors.offline}
+                  style={{ marginRight: 8 }}
+                />
+                <Text
+                  style={{
+                    fontFamily: "Inter_600SemiBold",
+                    fontSize: 15,
+                    color: colors.textPrimary,
+                  }}
+                >
+                  You're offline
+                </Text>
+              </View>
+              <Text
+                style={{
+                  color: colors.textSecondary,
+                  fontSize: 13,
+                  lineHeight: 18,
+                  marginTop: 2,
+                }}
+              >
+                {completedDownloads.length > 0
+                  ? `${completedDownloads.length} title${completedDownloads.length > 1 ? "s" : ""} ready to watch below.`
+                  : "Connect to the internet to browse, or download titles ahead of time."}
+              </Text>
+            </View>
+
+            {completedDownloads.length > 0 ? (
+              <View>
+                <Text
+                  style={{
+                    fontFamily: "PlayfairDisplay_700Bold",
+                    fontSize: 18,
+                    color: colors.textPrimary,
+                    marginBottom: 12,
+                  }}
+                >
+                  Downloaded
+                </Text>
+                <View className="flex-row flex-wrap" style={{ gap: 10 }}>
+                  {completedDownloads.slice(0, 6).map((d) => (
+                    <TouchableOpacity
+                      key={d.id}
+                      onPress={() => nav.push("/downloads")}
+                      activeOpacity={0.7}
+                      style={{ width: (SCREEN_WIDTH - 48 - 20) / 3 }}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Open ${d.title || d.fileName} download`}
+                    >
+                      <View
+                        style={{
+                          width: "100%",
+                          aspectRatio: 2 / 3,
+                          borderRadius: 10,
+                          backgroundColor: colors.bgElevated,
+                          alignItems: "center",
+                          justifyContent: "center",
+                        }}
+                      >
+                        <Ionicons
+                          name="film-outline"
+                          size={22}
+                          color={colors.iconSecondary}
+                        />
+                      </View>
+                      <Text
+                        className="text-zinc-400 text-[10px] mt-1.5"
+                        numberOfLines={1}
+                      >
+                        {d.title || d.fileName}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+                <TouchableOpacity
+                  onPress={() => nav.push("/downloads")}
+                  className="mt-3"
+                  activeOpacity={0.7}
+                >
+                  <Text
+                    style={{
+                      color: colors.gold,
+                      fontSize: 12,
+                      fontFamily: "Inter_500Medium",
+                    }}
+                  >
+                    View all downloads →
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            ) : (
+              <View className="items-center py-6">
+                <Text
+                  style={{
+                    color: colors.textTertiary,
+                    fontSize: 13,
+                    fontFamily: "Inter_400Regular",
+                  }}
+                >
+                  No downloads ready
+                </Text>
+                <Text
+                  style={{
+                    color: colors.textDisabled,
+                    fontSize: 11,
+                    fontFamily: "Inter_400Regular",
+                    marginTop: 2,
+                  }}
+                >
+                  Download movies and shows when you're online
+                </Text>
+              </View>
+            )}
+          </View>
+        ) : null}
+
+        {/* ── Dynamic Hero Banner – Latest Indian Movies Only ── */}
+        {settings.mode === "movie_tv" &&
+          (heroItem ? (
+            <Hero
+              item={heroItem}
+              onWatchPress={handleWatchPress}
+              onDetailsPress={handleMoviePress}
+            />
+          ) : !loadingIndianMovies ? (
+            <View
+              className="w-full"
+              style={{
+                height: heroHeightForWidth(SCREEN_WIDTH),
+                backgroundColor: colors.skeletonBgAlt,
+              }}
+            />
+          ) : null)}
+
+        {/* M2 — candidate ad slot under the hero. Renders nothing until the
+             remote ads-config enables it (measurement hook is separate). */}
+        {settings.mode === "movie_tv" && (
+          <AdSlot slot="home_hero" bottomMargin={16} />
+        )}
+
+        {/* ── Announcements — inline under hero, above first section.
+             Cache-first → present at first paint (no shift for returning users).
+             Late arrivals animate in; each dismiss uses FadeOutUp. ── */}
+        {announcements.length > 0 && (
+          <Animated.View
+            entering={FadeInDown.duration(300)}
+            exiting={FadeOutUp.duration(200)}
+            style={{
+              marginTop: 12,
+              marginHorizontal: 16,
+              maxHeight: 120,
+            }}
+          >
+            <ScrollView
+              style={{ maxHeight: 120 }}
+              showsVerticalScrollIndicator={false}
+              nestedScrollEnabled
+            >
+              {announcements.map((ann) => (
+                <Animated.View key={ann.id} exiting={FadeOutUp.duration(200)}>
+                  <AnnouncementBanner
+                    announcement={ann}
+                    onDismiss={handleDismissAnnouncement}
+                  />
+                </Animated.View>
+              ))}
+            </ScrollView>
+          </Animated.View>
+        )}
+
+        {/* Sections container: LinearTransition so rows below glide on insert/dismiss */}
+        <Animated.View layout={LinearTransition.duration(300)}>
+          {/* ── Hard Mode Split: anime mode swaps the data hook, not the layout ── */}
+          {settings.mode === "anime" ? (
+            <View>
+              {/* Continue Watching (anime-scoped history) — the movie_tv branch
+                  renders this via the orderedSections switch, but the anime branch
+                  only rendered <AnimeHomeFeed>, so CW was missing in anime mode.
+                  The store already scopes history to anime when mode==="anime"
+                  (:103-105) and ContinueWatchingSection handles p.isAnime nav. */}
+              {historyEntries.length > 0 ? (
+                <ContinueWatchingSection
+                  historyEntries={historyEntries}
+                  historyMeta={historyMeta}
+                  nav={nav}
+                  SCREEN_WIDTH={SCREEN_WIDTH}
+                  providerLabelMap={PROVIDER_LABELS}
+                  onRemoveItem={handleRemoveHistoryItem}
+                />
+              ) : !historyHydrated && getHistoryHint() === true ? (
+                <View style={{ height: CW_RESERVED_HEIGHT }} />
+              ) : null}
+              <AnimeHomeFeed nav={nav} />
+            </View>
+          ) : (
+            /* ── Remaining TMDB sections ordered by settings.homeRowOrder
+                (Continue Watching is included in homeRowOrder, so it renders
+                via the switch below — no separate block needed). ── */
+            orderedSections.map((id) => (
+              <View key={id}>{renderSection(id)}</View>
+            ))
+          )}
+        </Animated.View>
+      </ScrollView>
+    </View>
+  );
+}
+
+// ── Anime Home Feed (Hard Mode Split — anime mode) ──
+// Single <HomeFeed> layout, swapped data hook (AniList instead of TMDB). Cards
+// carry MAL ids; tapping resolves to the TMDB twin and pushes to its detail
+// page (which, in anime mode, threads MAL/AniList ids into the watch session).
+
+interface AnimeHomeFeedProps {
+  nav: ReturnType<typeof useSafeNavigation>;
+}
+
+function AnimeHomeFeed({ nav }: AnimeHomeFeedProps) {
+  const { data, isLoading } = useAniListHome();
+
+  const openAnime = useCallback(
+    (item: { id: number; malId: number | null }) => {
+      if (item.malId == null) return;
+      const twin = lookupMal(item.malId);
+      const params = new URLSearchParams({
+        isAnime: "1",
+        mid: String(item.malId),
+      });
+      if (twin?.tmdbShowId != null) {
+        if (twin.tmdbShowId != null) params.set("aid", String(item.id));
+        const url = `/watch/tv/${twin.tmdbShowId}?${params.toString()}`;
+        nav.push(url);
+      } else if (twin?.tmdbMovieId != null) {
+        if (twin.tmdbMovieId != null) params.set("aid", String(item.id));
+        const url = `/watch/movie/${twin.tmdbMovieId}?${params.toString()}`;
+        nav.push(url);
+      } else {
+      }
+    },
+    [nav],
+  );
+
+  const rows: Array<{ key: string; label: string; items: AniListMedia[] }> = [
+    { key: "trending", label: "Trending Anime", items: data?.trending ?? [] },
+    { key: "popular", label: "Popular Anime", items: data?.popular ?? [] },
+    { key: "seasonal", label: "This Season", items: data?.seasonal ?? [] },
+  ];
+
+  if (isLoading && !data) {
+    return (
+      <View className="px-4 mt-4">
+        <Shimmer width={160} height={20} borderRadius={4} />
+        <View className="flex-row mt-3" style={{ gap: 10 }}>
+          {Array.from({ length: 3 }).map((_, i) => (
+            <Shimmer key={i} width={110} height={165} borderRadius={12} />
+          ))}
+        </View>
+      </View>
+    );
+  }
+
+  return (
+    <View className="mt-2">
+      {rows.map((row) => (
+        <View key={row.key} className="mb-6">
+          <Text
+            style={[
+              typography.heading,
+              { marginHorizontal: 16, marginBottom: 12 },
+            ]}
+          >
+            {row.label}
+          </Text>
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={{ paddingHorizontal: 16, gap: 10 }}
+          >
+            {row.items.map((item) => (
+              <TouchableOpacity
+                key={item.id}
+                onPress={() => openAnime(item)}
+                activeOpacity={0.8}
+                style={{ width: 110 }}
+              >
+                <ProgressiveImage
+                  uri={item.coverImage ?? ""}
+                  style={{
+                    width: 110,
+                    height: 165,
+                    borderRadius: 12,
+                    backgroundColor: colors.skeletonBgAlt,
+                  }}
+                  resizeMode="cover"
+                />
+                <Text
+                  numberOfLines={2}
+                  style={{
+                    color: colors.textPrimary,
+                    fontSize: 12,
+                    marginTop: 6,
+                  }}
+                >
+                  {item.title}
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </ScrollView>
+        </View>
+      ))}
+    </View>
+  );
+}
+
+// ── Continue Watching Section (extracted to avoid nesting FlatList in ScrollView) ──
+
+interface ContinueWatchingSectionProps {
+  historyEntries: Array<{
+    latest: WatchProgress;
+    fullyWatched: boolean;
+  }>;
+  historyMeta: Record<string, Movie | null>;
+  nav: ReturnType<typeof useSafeNavigation>;
+  SCREEN_WIDTH: number;
+  providerLabelMap: Record<string, string>;
+  onRemoveItem: (tmdbId: string, mediaType: "movie" | "tv") => void;
+}
+
+const CW_CARD_WIDTH = 210;
+const CW_CARD_HEIGHT = 118; // 16:9 ratio
+
+function ContinueWatchingSection({
+  historyEntries,
+  historyMeta,
+  nav,
+  SCREEN_WIDTH,
+  providerLabelMap,
+  onRemoveItem,
+}: ContinueWatchingSectionProps) {
+  return (
+    <View className="mb-7">
+      {/* Header */}
+      <View className="flex-row items-center justify-between px-4 mb-3">
+        <Text style={typography.heading}>Continue Watching</Text>
+        <SeeAllButton onPress={() => nav.push("/history")} />
+      </View>
+
+      {/* Horizontal ScrollView with 16:9 Cinematic Cards */}
+      <SwipeExemptScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        contentContainerStyle={{ paddingHorizontal: 16, gap: 12 }}
+        accessibilityRole="list"
+        accessibilityLabel="Continue watching items"
+      >
+        {historyEntries.map((item) => {
+          const p = item.latest;
+          const meta = historyMeta[p.tmdbId];
+          const title = (p.mediaType === "tv" ? meta?.name : meta?.title) ?? "";
+          const imageUri = meta?.backdrop_path
+            ? getImageUrl(meta.backdrop_path, "w780")
+            : meta?.poster_path
+              ? getImageUrl(meta.poster_path, "w500")
+              : "";
+
+          return (
+            <TouchableOpacity
+              key={`${p.mediaType}:${p.tmdbId}`}
+              onPress={() => {
+                const base =
+                  p.mediaType === "tv"
+                    ? `/watch/tv/${p.tmdbId}/${p.season ?? 1}/${p.episode ?? 1}`
+                    : `/watch/movie/${p.tmdbId}`;
+                const params = new URLSearchParams({});
+                // Resume position — the player route reads this as `t`
+                if (p.currentTime > 5 && !item.fullyWatched) {
+                  params.set("t", String(Math.floor(p.currentTime)));
+                }
+                if (p.isAnime === true) {
+                  params.set("isAnime", "1");
+                  const ids = tmdbToAnimeIds(
+                    p.tmdbId,
+                    p.mediaType,
+                    p.season,
+                    p.episode,
+                  );
+                  if (ids) {
+                    params.set("mid", String(ids.malId));
+                    if (ids.anilistId != null)
+                      params.set("aid", String(ids.anilistId));
+                  }
+                }
+                // [watchperf] CW intent mark so every session has intentTap.
+                const perfKey =
+                  p.mediaType === "tv"
+                    ? `tv:${p.tmdbId}:s${p.season ?? 1}e${p.episode ?? 1}`
+                    : `movie:${p.tmdbId}`;
+                beginIntentTap(perfKey);
+                trackFeatureUsed("cw_resume", "library");
+                nav.push(
+                  params.toString() ? `${base}?${params.toString()}` : base,
+                );
+              }}
+              activeOpacity={0.8}
+              style={{ width: CW_CARD_WIDTH }}
+              accessibilityRole="button"
+              accessibilityLabel={`Continue watching ${title}`}
+              accessibilityHint={`Opens ${title} at your last watched position`}
+            >
+              {/* 16:9 Thumbnail Box */}
+              <View
+                style={{
+                  width: CW_CARD_WIDTH,
+                  height: CW_CARD_HEIGHT,
+                  borderRadius: 14,
+                  overflow: "hidden",
+                  backgroundColor: colors.bgElevated,
+                  borderWidth: 0.5,
+                  borderColor: colors.borderSubtle,
+                  position: "relative",
+                }}
+              >
+                {imageUri ? (
+                  <ProgressiveImage
+                    uri={imageUri}
+                    style={{ width: CW_CARD_WIDTH, height: CW_CARD_HEIGHT }}
+                    resizeMode="cover"
+                  />
+                ) : (
+                  <View
+                    className="flex-1 items-center justify-center"
+                    style={{ backgroundColor: colors.bgTop }}
+                  >
+                    <Ionicons
+                      name={p.mediaType === "tv" ? "tv" : "film"}
+                      size={28}
+                      color={colors.iconMuted}
+                    />
+                  </View>
+                )}
+
+                {/* Central Play Button Overlay */}
+                <View
+                  style={{
+                    position: "absolute",
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    alignItems: "center",
+                    justifyContent: "center",
+                    backgroundColor: "rgba(0,0,0,0.30)",
+                  }}
+                >
+                  <View
+                    style={{
+                      width: 36,
+                      height: 36,
+                      borderRadius: 18,
+                      backgroundColor: "rgba(14, 14, 17, 0.82)",
+                      borderWidth: 1,
+                      borderColor: "rgba(255, 255, 255, 0.25)",
+                      alignItems: "center",
+                      justifyContent: "center",
+                    }}
+                  >
+                    <Ionicons
+                      name="play"
+                      size={16}
+                      color={colors.gold}
+                      style={{ marginLeft: 2 }}
+                    />
+                  </View>
+                </View>
+
+                {/* TV Episode Pill Badge */}
+                {p.mediaType === "tv" &&
+                  p.season != null &&
+                  p.episode != null && (
+                    <View
+                      style={{
+                        position: "absolute",
+                        top: 6,
+                        left: 6,
+                        backgroundColor: "rgba(14, 14, 17, 0.85)",
+                        borderRadius: 6,
+                        paddingHorizontal: 6,
+                        paddingVertical: 2,
+                        borderWidth: 0.5,
+                        borderColor: colors.borderSubtle,
+                      }}
+                    >
+                      <Text
+                        style={{
+                          color: colors.gold,
+                          fontSize: 10,
+                          fontFamily: "Inter_600SemiBold",
+                        }}
+                      >
+                        S{p.season}:E{p.episode}
+                      </Text>
+                    </View>
+                  )}
+
+                {/* Dismiss / Remove Button */}
+                <TouchableOpacity
+                  onPress={(e) => {
+                    e.stopPropagation();
+                    onRemoveItem(p.tmdbId, p.mediaType);
+                  }}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                  activeOpacity={0.7}
+                  style={{
+                    position: "absolute",
+                    top: 6,
+                    right: 6,
+                    width: 22,
+                    height: 22,
+                    borderRadius: 11,
+                    backgroundColor: "rgba(0,0,0,0.65)",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    borderWidth: 0.5,
+                    borderColor: "rgba(255,255,255,0.2)",
+                  }}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Remove ${title} from continue watching`}
+                >
+                  <Ionicons name="close" size={12} color="#fff" />
+                </TouchableOpacity>
+
+                {/* Bottom Gold Progress Bar */}
+                <View
+                  style={{
+                    position: "absolute",
+                    bottom: 0,
+                    left: 0,
+                    right: 0,
+                    height: 3.5,
+                    backgroundColor: "rgba(255,255,255,0.25)",
+                    borderBottomLeftRadius: 14,
+                    borderBottomRightRadius: 14,
+                    overflow: "hidden",
+                  }}
+                >
+                  <View
+                    style={{
+                      width: `${Math.round((p.completed ? 1 : p.percent) * 100)}%`,
+                      height: "100%",
+                      backgroundColor: item.fullyWatched
+                        ? colors.successGreen
+                        : colors.gold,
+                    }}
+                  />
+                </View>
+              </View>
+
+              {/* Title & Progress details below thumbnail */}
+              <View style={{ marginTop: 6, paddingHorizontal: 2 }}>
+                <Text
+                  style={{
+                    color: colors.textPrimary,
+                    fontSize: 12,
+                    fontFamily: "Inter_600SemiBold",
+                  }}
+                  numberOfLines={1}
+                >
+                  {title || `ID: ${p.tmdbId}`}
+                </Text>
+                <Text
+                  style={{
+                    color: colors.textTertiary,
+                    fontSize: 10,
+                    fontFamily: "Inter_400Regular",
+                    marginTop: 2,
+                  }}
+                >
+                  {Math.round((p.completed ? 1 : p.percent) * 100)}% watched
+                </Text>
+              </View>
+            </TouchableOpacity>
+          );
+        })}
+      </SwipeExemptScrollView>
+    </View>
+  );
+}

@@ -1,0 +1,98 @@
+{
+  "announcements": [
+    {
+      "id": "welcome-to-filmsnaps",
+      "type": "feature",
+      "title": "Welcome to FilmSnaps",
+      "subtitle": "Stream movies and TV shows for free. No sign-up required.",
+      "body": [
+        "FilmSnaps lets you watch thousands of movies and TV shows instantly — no account, no subscription, no payment needed.",
+        "Browse trending titles, search for your favorites, or explore by category. Tap any title to see available streaming sources and start watching.",
+        "You can also download content to watch offline, track your watch history, and save titles to your personal list."
+      ],
+      "detailRoute": "/announcement/welcome-to-filmsnaps",
+      "actionLabel": "Get Started",
+      "date": "July 29, 2026",
+      "dismissible": true,
+      "expiresAt": "2026-12-31T00:00:00Z"
+    },
+    {
+      "id": "v2-anime-support",
+      "type": "feature",
+      "title": "New version released — Full anime support added",
+      "subtitle": "Switch to Anime mode to unlock MegaPlay streaming. Download the new version from https://filmsnap-pro.netlify.app/download.",
+      "body": [
+        "FilmSnaps 2.1.0 is here, and the headline feature is complete anime support.",
+        "Toggle Anime mode from the home header. In Anime mode the app surfaces anime titles through AniList search and routes playback to MegaPlay — our dedicated anime streaming source.",
+        "Every anime title is matched to its MyAnimeList / AniList ID automatically, so episodes line up correctly with no manual cour math. If a source returns a 410, the player automatically falls back to the alternate ID space (MAL ↔ AniList) so playback keeps going.",
+        "Anime and regular movie/TV libraries are kept separate. Your watch history, continue-watching, and saved list stay organized by content type, and a title always opens with the correct set of servers regardless of which mode you're in.",
+        "Download the new version 2.1.0 from our website at https://filmsnap-pro.netlify.app/download and start watching anime today."
+      ],
+      "actionLabel": "Download",
+      "externalUrl": "https://filmsnap-pro.netlify.app/download",
+      "date": "August 24, 2026",
+      "dismissible": true,
+      "expiresAt": "2027-08-24T00:00:00Z",
+      "hideFromVersion": "2.1.0"
+    },
+    {
+      "id": "v2-2-1-direct-streaming",
+      "type": "feature",
+      "title": "New version released — 2.2.1 with faster, self-healing streaming",
+      "subtitle": "4k Streams now load directly on your device and the player recovers automatically when a source fails. Update from https://filmsnaps1.anonymous260260a.workers.dev/download.",
+      "body": [
+        "FilmSnaps 2.2.1 makes streaming faster and far more resilient.",
+        "Stream links are now fetched directly on your device instead of hopping through our server, so playback starts sooner. Provider addresses live in a remote registry — if a source ever changes its domain, we can update it server-side and every app version keeps working, no update required on your end.",
+        "Playback is now self-healing: if a source dies mid-load or stops responding, the player automatically switches to the next provider. A new Try Another Server button lets you jump manually whenever you want.",
+        "Continue Watching is pre-warmed: streams for your three most recent titles are fetched and validated in the background while you browse — including the next episode of anything you finished — so tapping a card starts playing almost instantly.",
+        "The player got a major upgrade: audio track selection, a subtitle sheet with search, player settings, a stream picker, double-tap to seek, and a first-run language prompt.",
+        "Several reliability fixes are also in: video and audio now stop when you minimize the app, the back-press toast auto-hides, the Continue Watching row scrolls properly, and the loading spinner no longer sticks after you return from minimize.",
+        "Download version 2.2.1 from https://filmsnaps1.anonymous260260a.workers.dev/download."
+      ],
+      "actionLabel": "Download",
+      "externalUrl": "https://filmsnaps1.anonymous260260a.workers.dev/download",
+      "date": "September 10, 2026",
+      "dismissible": true,
+      "expiresAt": "2027-09-10T00:00:00Z",
+      "hideFromVersion": "2.2.0"
+    },
+    {
+      "id": "v2-4-0-anime-direct",
+      "type": "feature",
+      "title": "New version released — 2.4.0 brings the full anime experience",
+      "subtitle": "Anime now streams directly from JustAnime with subtitles built in, plus a redesigned player. Download from https://filmsnaps1.anonymous260260a.workers.dev/download.",
+      "body": [
+        "FilmSnaps 2.4.0 is here — the biggest anime upgrade since 2.1.0, plus a redesigned player.",
+        "Anime now streams directly from JustAnime: episodes are fetched straight to your device with both sub and dub tracks and built-in subtitle support, so anime plays with fewer hops and less buffering.",
+        "The app picks the best server automatically: sources are ranked by speed and reliability before you press play, streams are pre-fetched in the background, and if one server fails the player falls back to the next without you touching anything.",
+        "The player got its biggest visual refresh yet: a new episode panel shows every episode and jumps straight to the one you're watching, the progress bar is now YouTube-style with tap-to-seek and precise scrubbing, a new screen-fit setting lets you choose how video fills the screen, and the controls sit better in landscape.",
+        "We also fixed the annoying ones: the next episode now resumes at the right timestamp instead of the previous episode's end, seeking stays accurate through the end of the video, and sheets open and close with smooth animations. Download version 2.4.0 from https://filmsnaps1.anonymous260260a.workers.dev/download."
+      ],
+      "actionLabel": "Download",
+      "externalUrl": "https://filmsnaps1.anonymous260260a.workers.dev/download",
+      "date": "October 3, 2026",
+      "dismissible": true,
+      "expiresAt": "2027-10-03T00:00:00Z",
+      "hideFromVersion": "2.4.0"
+    },
+    {
+      "id": "v2-5-0-stability",
+      "type": "feature",
+      "title": "New version released — 2.5.0 stability fixes",
+      "subtitle": "Updating is NOT necessary — this is a bug-fix release for crashes mostly seen on Android 9 and 10. If you're hitting those bugs, update; otherwise feel free anyway. Download from https://filmsnaps1.anonymous260260a.workers.dev/download.",
+      "body": [
+        "FilmSnaps 2.5.0 is a stability release. Updating is not necessary — most users will see no change in features.",
+        "This release fixes bugs that were mostly experienced on Android 9 and Android 10: player crashes when a source is released mid-playback, a fatal low-memory speech-detection crash, subtitle and download workers dying in the background, and WebView exceptions that could take the app down.",
+        "Anime is also repaired: JustAnime was returning 404 on every server because the app queried with the wrong id space — it now uses AniList ids, so direct anime playback works again, including titles missing from the local mapping table.",
+        "Other fixes: fullscreen immersive mode now stays on when you switch to the next episode in fullscreen, the progress bar no longer drops to 0% on seek, Falix moved to its new host, and downloads gained speed limits, offline playback, and TV episode grouping.",
+        "If you are getting those crashes or broken anime playback, update to 2.5.0. Otherwise, feel free to update anyway. Download from https://filmsnaps1.anonymous260260a.workers.dev/download."
+      ],
+      "actionLabel": "Download",
+      "externalUrl": "https://filmsnaps1.anonymous260260a.workers.dev/download",
+      "date": "November 4, 2026",
+      "dismissible": true,
+      "expiresAt": "2027-11-04T00:00:00Z",
+      "hideFromVersion": "2.5.0"
+    }
+  ]
+}

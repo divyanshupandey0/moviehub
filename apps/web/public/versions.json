@@ -1,0 +1,109 @@
+{
+  "versions": [
+    {
+      "version": "2.5.0",
+      "date": "2026-11-04",
+      "releaseNotes": "Crash fixes: the player no longer crashes when a video source is released mid-playback, low-memory devices no longer hit a fatal speech-detection crash, subtitle probing and download workers survive background teardown, promise rejections in haptics/KeepAwake/play-pause can no longer take down the app, and the player WebView is hardened against fatal uncaught exceptions. Anime back: JustAnime now queries with the correct AniList id — all four JustAnime servers were returning 404 and falling back; MAL + AniList ids are carried from search through to playback, so titles missing from the local mapping table still play. Player: fullscreen immersive mode now stays active when you switch to the next episode while in fullscreen, the progress bar no longer drops to 0% on seek or source reload, HEVC dual-decoder playback and first-frame speed are improved, VTT subtitle files convert to SRT so subtitle position applies, and answering the audio-language prompt from Settings now counts. Streaming: HTML resolver pages are treated as dead sources (fewer stuck probes), Falix moved to its new host and API, and saved servers that cannot play anime are ignored in anime mode. Downloads: speed limits, notification actions, offline playback, title-based file names, metadata badges, TV episode grouping, and fail-fast behavior on dead links or full storage.",
+      "downloadUrl": "https://github.com/anonymous260260a-arch/filmsnaps/releases/download/v2.5.0/filmsnaps-v2.5.0.apk",
+      "size": "~125 MB"
+    },
+    {
+      "version": "2.4.0",
+      "date": "2026-10-03",
+      "releaseNotes": "Per-title theming: pages now pick up colors from each title's own artwork. Subtitle reposition: new orientation-aware subtitle position — Low in portrait, Middle in landscape, plus an Auto mode that re-anchors subtitles the moment you rotate. Full subtitle toolkit: sidecar subtitle files straight from the source's own pool (with download and attach retries), an auto-sync engine that stays attached across seeks, and online subtitle search inside the player. Refreshed detail and browse pages: reworked hero, expanded list pages with chips, rails and an episode strip, and ranked search that puts the best title match first. Fixes: Continue Watching no longer plays the wrong episode after you finish one — auto-resume now notifies the player pipeline, so the card you pick and the stream that plays are the same episode; the subtitle sheet can no longer show the previous episode's results after you switch episodes; manual server picks are no longer ignored (picker and playback now agree); the legal gate no longer reappears after dismissal; cold-start 'all sources failed' shows an error card instead of silently dropping into a fallback embed; stream picker and sheets pre-mount as soon as links land so taps respond sooner. Also: /movie/:id and /tv/:id deep links open the app directly via Android App Links, new MovieBox and Bing sources, HDHub download pages, and better download ranking.",
+      "downloadUrl": "https://github.com/anonymous260260a-arch/filmsnaps/releases/download/v2.4.0/filmsnaps-v2.4.0.apk",
+      "size": "~125 MB"
+    },
+    {
+      "version": "2.3.0",
+      "date": "2026-09-27",
+      "releaseNotes": "Anime goes direct: watch anime through the new JustAnime source streamed straight to your device — sub and dub tracks with built-in subtitles, smart server ranking that picks the fastest working source, and automatic fallback when one fails. Player redesign: a new episode panel that jumps straight to the episode you're watching, a YouTube-style progress bar with tap-to-seek and precise drag scrubbing, a screen-fit setting, and cleaner controls in landscape. Fixes: the next episode now resumes at the right timestamp instead of the previous episode's end, seeking stays accurate, and sheets open and close with smooth animations.",
+      "downloadUrl": "https://github.com/anonymous260260a-arch/filmsnaps/releases/download/v2.3.0/filmsnaps-v2.3.0.apk",
+      "size": "~125 MB"
+    },
+    {
+      "version": "2.2.1",
+      "date": "2026-09-13",
+      "releaseNotes": "Stream stability fixes: playback recovers automatically when a source dies mid-stream, server switching no longer hangs on slow sources, and the Falix fallback now kicks in reliably when direct sources fail. Progress bar fixes: seeking stays accurate on HEVC and MKV streams — the scrubber no longer jumps or stalls near the end, and buffered-range display matches real playback position. Smarter sources: faster stream validation with fewer falsely-dead servers, better next-episode prefetch, and improved source switching when your pick fails. Anime feeds now fall back across four providers automatically if one goes down.",
+      "downloadUrl": "https://github.com/anonymous260260a-arch/filmsnaps/releases/download/v2.2.1/filmsnaps-v2.2.1.apk",
+      "size": "~125 MB"
+    },
+    {
+      "version": "2.2.0",
+      "date": "2026-09-10",
+      "releaseNotes": "Direct on-device streaming: stream links are fetched straight from the provider on your device for faster starts, backed by a remote-updatable provider registry so source domains can change without an app update. Self-healing playback: if a source dies or times out, the player automatically switches to the next provider, with a new Try Another Server button. Continue Watching pre-warms and validates streams for your top 3 resume titles in the background — including the next episode of titles you finished. Player overhaul: audio track sheet, subtitle sheet with server-side search, player settings, stream picker, double-tap seek with ripple feedback, refined progress bar, and a first-run language prompt. Reliability fixes: video and audio now stop when you minimize the app, the back-press toast auto-hides, the Continue Watching row scrolls horizontally, and the loading spinner no longer sticks after returning from minimize. Smarter streaming: network speed badge, adaptive buffer profiles, byte-level stream validation (fewer falsely-dead sources), and last-working-source memory.",
+      "downloadUrl": "https://github.com/anonymous260260a-arch/filmsnaps/releases/download/v2.2.0/filmsnaps-v2.2.0.apk",
+      "size": "~90 MB"
+    },
+    {
+      "version": "2.1.0",
+      "date": "2026-08-24",
+      "releaseNotes": "Full anime support: Anime mode toggle surfaces anime titles via AniList search and routes playback to MegaPlay. Every anime title auto-matches to its MyAnimeList / AniList ID with automatic 410 fallback between ID spaces. Movie/TV and anime libraries stay separate — watch history, continue-watching, and saved lists are organized by content type, and any title always opens with the correct set of servers regardless of active mode. Search filter simplified to Movies/TV and Anime. Version-gated in-app announcement drives users to the website download.",
+      "downloadUrl": "https://github.com/anonymous260260a-arch/filmsnaps/releases/download/v2.1.0/filmsnaps-v2.1.0.apk",
+      "size": "~90 MB"
+    },
+    {
+      "version": "2.0.0",
+      "date": "2026-08-20",
+      "releaseNotes": "v2.0.0 — Desktop security architecture overhaul: migrated from <webview> to WebContentsView with full ad-blocking engine restructure (Ghostery engine + uBO filter lists + Ed25519-signed OTA config). Android player reliability: server-redirect fix for viduki.net/videasy.net, devtools-detector.js stub injection, disable-devtool patch. New Settings Community section with GitHub + Website links and Star on GitHub card. Download engine v2 with live byte tracking for accurate pause/resume. New Feedback Portal with 14-layer abuse prevention (Turnstile CAPTCHA, rate limiting, spam scoring, offline queue).",
+      "downloadUrl": "https://github.com/anonymous260260a-arch/filmsnaps/releases/download/v2.0.0/filmsnaps-v2.0.0.apk",
+      "size": "~90 MB"
+    },
+    {
+      "version": "1.0.7",
+      "date": "2026-08-09",
+      "releaseNotes": "New VidZee provider · ad-blocking engine degenerate-pattern fix (VidZee streams no longer blocked) · Screenscape ad-suppression V5 (stale-anchor API payload, storage seeding, document-start cosmetics) · Provider home-page escape guard (stay in the player) · Swipe-based tab navigation.",
+      "downloadUrl": "https://github.com/anonymous260260a-arch/filmsnaps/releases/download/v1.0.7/filmsnaps-v1.0.7.apk",
+      "size": "~90 MB"
+    },
+    {
+      "version": "1.0.6",
+      "date": "2026-07-27",
+      "releaseNotes": "New Feedback Portal with Cloudflare D1 production backend · Download engine fixes (pause/resume reliability, live byte tracking) · How Content Works transparency page · Theme color token migration · Security hardening with 14-layer abuse prevention and Turnstile · Offline queue support.",
+      "downloadUrl": "https://github.com/anonymous260260a-arch/filmsnaps/releases/download/v1.0.6/filmsnaps-v1.0.6.apk",
+      "size": "~90 MB"
+    },
+    {
+      "version": "1.0.5",
+      "date": "2026-07-27",
+      "releaseNotes": "How Content Works page with collapsible sections + FAQ · CoachMarks first-run guide removed · Library page NetInfo crash fixed · ForwardIcon arrow added to See All buttons · Library tab icon fixed · Native module changes — new EAS build required (runtime 57.0.0)",
+      "downloadUrl": "https://github.com/anonymous260260a-arch/filmsnaps/releases/download/v1.0.5/filmsnaps-v1.0.5.apk",
+      "size": "~90 MB"
+    },
+    {
+      "version": "1.0.4",
+      "date": "2025-07-09",
+      "releaseNotes": "Next Episode now works across seasons (S1E10 → S2E1) · Fullscreen Next Episode button stays visible · Screen stays awake during playback · Orientation locks to landscape in fullscreen, returns to portrait on exit · OTA updates enabled via EAS (channel: preview, runtime: 55.0.0) · New providers: ScreenScape, Nxsha · StreamGuide refactored to stable iframe · Cloudflare Workers backend with edge caching · Fixed React Hooks crash on detail screens · App icon updated",
+      "downloadUrl": "https://github.com/anonymous260260a-arch/filmsnaps/releases/download/v1.0.4/filmsnaps-v1.0.4.apk",
+      "size": "~90 MB"
+    },
+    {
+      "version": "1.0.3",
+      "date": "2026-06-24",
+      "releaseNotes": "StreamGuide custom video player with seek optimization — smoother controls, performance improvements, enhanced playback experience.",
+      "downloadUrl": "https://github.com/anonymous260260a-arch/filmsnaps/releases/download/v1.0.3/filmsnaps-v1.0.3.apk",
+      "size": "~90 MB"
+    },
+    {
+      "version": "1.0.2",
+      "date": "2026-06-21",
+      "releaseNotes": "Navigation bar overlap fixed — system nav bar no longer hides the bottom tab bar. Tab bar now uses safe area padding for proper positioning.",
+      "downloadUrl": "https://github.com/anonymous260260a-arch/filmsnaps/releases/download/v1.0.2/filmsnaps-v1.0.2.apk",
+      "size": "~90 MB"
+    },
+    {
+      "version": "1.0.1",
+      "date": "2026-06-21",
+      "releaseNotes": "Blank screen on launch fixed — API URL now correctly points to production. App properly connects to live backend.",
+      "downloadUrl": "https://github.com/anonymous260260a-arch/filmsnaps/releases/download/v1.0.1/filmsnaps-v1.0.1.apk",
+      "size": "~90 MB"
+    },
+    {
+      "version": "1.0.0",
+      "date": "2026-06-20",
+      "releaseNotes": "Initial release. Browse movies and TV shows, search, bookmark favorites, view trailers and streaming options.",
+      "downloadUrl": "https://github.com/anonymous260260a-arch/filmsnaps/releases/download/v1.0.0/filmsnaps-v1.0.0.apk",
+      "size": "~90 MB"
+    }
+  ]
+}

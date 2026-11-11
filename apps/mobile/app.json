@@ -1,0 +1,99 @@
+{
+  "expo": {
+    "name": "MOVIE HUB",
+    "slug": "movie-hub",
+    "version": "2.6.2",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": ["moviehub", "filmsnaps"],
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#080808",
+      "imageWidth": 260
+    },
+    "android": {
+      "versionCode": 12,
+      "backgroundColor": "#080808",
+      "adaptiveIcon": {
+        "backgroundColor": "#080808",
+        "foregroundImage": "./assets/icon.png"
+      },
+      "splash": {
+        "image": "./assets/splash.png",
+        "resizeMode": "contain",
+        "backgroundColor": "#080808",
+        "imageWidth": 260
+      },
+      "package": "app.filmsnaps.mobile",
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "autoVerify": true,
+          "category": ["DEFAULT", "BROWSABLE"],
+          "data": [
+            {
+              "scheme": "https",
+              "host": "filmsnap-pro.netlify.app",
+              "pathPrefix": "/movie"
+            },
+            {
+              "scheme": "https",
+              "host": "filmsnap-pro.netlify.app",
+              "pathPrefix": "/tv"
+            }
+          ]
+        }
+      ],
+      "navigationBar": {
+        "visible": "sticky-immersive",
+        "backgroundColor": "#18181b"
+      },
+      "permissions": [
+        "android.permission.INTERNET",
+        "android.permission.ACCESS_NETWORK_STATE",
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.WAKE_LOCK"
+      ]
+    },
+    "web": {
+      "bundler": "metro",
+      "favicon": "./assets/icon.png"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/708a926e-0243-4a25-ae80-1780906c8c04",
+      "enabled": true,
+      "checkAutomatically": "ON_LOAD",
+      "fallbackToCacheTimeout": 0
+    },
+    "plugins": [
+      "expo-router",
+      "expo-sharing",
+      "expo-updates",
+      "expo-video",
+      "expo-sqlite",
+      "expo-notifications",
+      "@sentry/react-native/expo",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash.png",
+          "resizeMode": "contain",
+          "backgroundColor": "#080808",
+          "imageWidth": 260
+        }
+      ],
+      "./plugins/with-filmsnaps-downloader"
+    ],
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "708a926e-0243-4a25-ae80-1780906c8c04"
+      },
+      "feedbackUrl": "https://filmsnaps-feedback.anonymous260260a.workers.dev"
+    },
+    "runtimeVersion": "64.0.0"
+  }
+}

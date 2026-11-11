@@ -1,0 +1,130 @@
+import React from "react";
+import { View, Text, TouchableOpacity, StyleSheet } from "react-native";
+import * as SplashScreen from "expo-splash-screen";
+import { captureAppError } from "../lib/sentry";
+import { trackBoundaryError } from "../lib/telemetry";
+
+/** E9 — coarse error class (no message/file/line/stack ever leaves device). */
+function coarseErrorClass(error: Error): string {
+  const m = (error?.message ?? "").toLowerCase();
+  if (m.includes("network") || m.includes("fetch") || m.includes("socket")) {
+    return "network";
+  }
+  if (m.includes("timeout") || m.includes("timed out")) return "timeout";
+  if (m.includes("json") || m.includes("parse")) return "parse";
+  if (m.includes("undefined") || m.includes("null")) return "undefined-ref";
+  if (m.includes("not a function")) return "type";
+  if (m.includes("navigation") || m.includes("go_back")) return "navigation";
+  return "other";
+}
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+  error: Error | null;
+}
+
+interface ErrorBoundaryProps {
+  children: React.ReactNode;
+  fallback?: React.ReactNode;
+  onError?: (error: Error, errorInfo: React.ErrorInfo) => void;
+  /**
+   * Called when the error is a GO_BACK navigation error.
+   * The root layout provides this to navigate home instead of
+   * showing a crash screen.
+   */
+  onGoBackError?: () => void;
+}
+
+export class ErrorBoundary extends React.Component<
+  ErrorBoundaryProps,
+  ErrorBoundaryState
+> {
+  constructor(props: ErrorBoundaryProps) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
+    console.error("[ErrorBoundary] Caught error:", error.message);
+    captureAppError(error);
+    // E9 — coarse boundary_error with NO file/line/stack. Detail stays in
+    // Sentry (and the console). Never sends the raw message.
+    trackBoundaryError({ errorClass: coarseErrorClass(error) });
+    this.props.onError?.(error, errorInfo);
+    // Always release the native splash if we crash while it is still held.
+    SplashScreen.hideAsync().catch(() => {});
+
+    // If it's a GO_BACK navigation error, delegate to the handler
+    // instead of showing error UI. This prevents the app from showing
+    // a crash screen when the user taps back on a screen with no back stack.
+    if (error.message?.includes?.("GO_BACK") && this.props.onGoBackError) {
+      this.props.onGoBackError();
+      // Also clear the error state after navigation
+      this.setState({ hasError: false, error: null });
+    }
+  }
+
+  handleRetry = () => {
+    this.setState({ hasError: false, error: null });
+  };
+
+  render() {
+    if (this.state.hasError) {
+      if (this.props.fallback) {
+        return this.props.fallback;
+      }
+
+      return (
+        <View style={styles.container}>
+          <Text style={styles.title}>Something went wrong</Text>
+          <Text style={styles.message}>
+            {this.state.error?.message || "An unexpected error occurred"}
+          </Text>
+          <TouchableOpacity style={styles.button} onPress={this.handleRetry}>
+            <Text style={styles.buttonText}>Try Again</Text>
+          </TouchableOpacity>
+        </View>
+      );
+    }
+
+    return this.props.children;
+  }
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: "#070708",
+    justifyContent: "center",
+    alignItems: "center",
+    padding: 24,
+  },
+  title: {
+    fontSize: 20,
+    fontWeight: "700",
+    color: "#F4F4F5",
+    marginBottom: 8,
+  },
+  message: {
+    fontSize: 14,
+    color: "#A1A1AA",
+    textAlign: "center",
+    marginBottom: 24,
+    lineHeight: 20,
+  },
+  button: {
+    backgroundColor: "#D4A237",
+    paddingHorizontal: 24,
+    paddingVertical: 12,
+    borderRadius: 8,
+  },
+  buttonText: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#070708",
+  },
+});

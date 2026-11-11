@@ -1,0 +1,6 @@
+# Build-critical scripts/ dir must ship in source archives.
+# Root .gitignore's `scripts/` rule is now anchored to /scripts/ (repo root
+# only), so this nested scripts/ dir is never matched. Kept as an explicit
+# safeguard so a future un-anchoring of the root rule cannot silently drop
+# fix-dist-imports.mjs from EAS/Netlify build archives.
+!scripts/

@@ -1,0 +1,425 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* â”€â”€ "Cinematic Void" Design System â”€â”€
+ * Tokens are HSL triplets — every utility (bg-primary, fill-amber-accent,
+ * text-muted-foreground, ...) compiles to `hsl(var(--x))`, so the values here
+ * must be space-separated `H S% L%` (NOT hex). Hex sources are kept as
+ * comments for reference. Primitive hex sources (#070708 etc.) match the
+ * shared design tokens in @filmsnaps/shared, EXCEPT --secondary: shared keeps
+ * lavender #8B5CF6 (mobile uses it as a real accent), while the web Cinematic
+ * Void theme uses a neutral elevated surface so skeletons/inputs/secondary
+ * buttons stay gray-on-black.
+ * Font families: --font-display (Fraunces, was Playfair Display), --font-body (Geist)
+ */
+@layer base {
+  :root {
+    /* Core Surfaces */
+    --void: 240 7% 3%; /* #070708 */
+    --surface: 240 10% 6%; /* #0E0E11 */
+    --elevated: 240 8% 9%; /* #16161A */
+    --subtle: 240 6% 14%; /* #222226 */
+
+    /* Background / foreground â€” mapping to shadcn convention */
+    --background: var(--void);
+    --foreground: 240 5% 96%; /* #F4F4F5 */
+
+    --card: var(--surface);
+    --card-foreground: 240 5% 96%; /* #F4F4F5 */
+
+    --popover: var(--surface);
+    --popover-foreground: 240 5% 96%; /* #F4F4F5 */
+
+    /* Brand & Action Colors â€” Amber Gold */
+    --primary: 41 65% 52%; /* #D4A237 */
+    --primary-foreground: 240 7% 3%; /* #070708 */
+    --primary-dim: 41 63% 44%; /* #B88B2A */
+    --amber-accent: 41 65% 52%; /* #D4A237 */
+
+    /* Secondary surface â€” neutral placeholder tone (skeletons, inputs,
+       secondary buttons). Was lavender #8B5CF6 (old theme); the Cinematic
+       Void theme uses neutral grays, so this maps to the elevated surface. */
+    --secondary: 240 8% 9%; /* #16161A */
+    --secondary-foreground: 240 5% 96%; /* #F4F4F5 */
+
+    --success: 153 39% 49%; /* #4CAF82 */
+    --destructive: 0 70% 60%; /* #E05252 */
+    --destructive-foreground: 240 5% 96%; /* #F4F4F5 */
+    --info: 215 90% 66%; /* #5B9CF6 */
+
+    /* Muted surfaces */
+    --muted: var(--subtle);
+    --muted-foreground: 240 5% 65%; /* #A1A1AA */
+
+    /* Faint — tertiary text tier. STRICTLY for UI chrome, placeholders and
+       disabled states (expert verdict 08-22). ~5.3–5.8:1 on void/card,
+       passes AA normal text. Content-bearing text uses muted-foreground. */
+    --faint: 240 5% 55%; /* #858591 */
+    --faint-foreground: 240 5% 65%;
+
+    /* Accent matches muted for buttons etc */
+    --accent: var(--subtle);
+    --accent-foreground: 240 5% 96%; /* #F4F4F5 */
+
+    /* Borders & Inputs */
+    --border: var(--subtle);
+    --input: var(--subtle);
+    --ring: 41 65% 52%; /* #D4A237 */
+
+    --radius: 0.75rem;
+
+    /* ── Typography tokens (Precision Dark) ── */
+    /* Body / UI font sizes */
+    --font-size-xs: 0.75rem;
+    --font-size-sm: 0.875rem;
+    --font-size-md: 1rem;
+    --font-size-lg: 1.125rem;
+    --font-size-xl: 1.25rem;
+    --font-size-2xl: 1.5rem;
+    --font-size-3xl: 1.875rem;
+
+    /* Line heights */
+    --leading-tight: 1.25;
+    --leading-normal: 1.5;
+    --leading-loose: 1.75;
+
+    /* Letter spacing */
+    --tracking-tight: -0.02em;
+    --tracking-normal: 0;
+    --tracking-wide: 0.02em;
+
+    /* Desktop shell compensation — top gutter for PageShell pages under
+       the in-flow GlobalTopBar (expert spacing verdict Q1: one 32px gutter
+       between app chrome and page canvas). */
+    --desktop-main-pt: 2rem;
+  }
+}
+
+/* â”€â”€ Base Styles â”€â”€ */
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased overflow-x-hidden;
+    background-color: hsl(var(--void));
+    color: #F4F4F5;
+    font-family: var(--font-body), -apple-system, BlinkMacSystemFont,
+      'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans',
+      'Helvetica Neue', sans-serif;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  ::selection {
+    background-color: rgba(212, 162, 55, 0.25); /* primary #D4A237 at 25% */
+    color: #F4F4F5;
+  }
+
+  /* Fraunces for headings (was Playfair Display — high-contrast didone washed
+     out on dark UI; Fraunces is optical-sized + low-contrast, far more legible) */
+  h1, h2, h3, h4 {
+    font-family: var(--font-display), 'Fraunces', Georgia, serif;
+  }
+}
+
+/* â”€â”€ Hide Scrollbar (functional) â”€â”€ */
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+.scrollbar-hide {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+/* â”€â”€ Desktop-Style Scrollbars â”€â”€
+ * Thin, dark, gold-on-hover — replaces the bright Chromium default so
+ * the frameless desktop app reads as a native app rather than a browser. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.10);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(212, 162, 55, 0.45);
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* â”€â”€ Frameless Window Drag Regions â”€â”€
+ * Electron requires -webkit-app-region to move a frameless window.
+ * These were referenced by WatchTopBar/DesktopTitleBar but never defined,
+ * so the window could not be dragged. `.no-drag` must be applied to every
+ * interactive element inside a drag region or clicks get swallowed. */
+@layer utilities {
+  .drag-region {
+    -webkit-app-region: drag;
+    app-region: drag;
+  }
+  .no-drag {
+    -webkit-app-region: no-drag;
+  }
+}
+
+/* â”€â”€ Desktop Shell Scope â”€â”€
+ * Under the desktop shell the top bar is in-flow, so the per-page
+ * pt-16/pt-20/pt-24 classes that cleared the old fixed website header
+ * become dead space. Neutralize them inside the shell only (specificity
+ * 0,1,1 beats the utility class, and it never touches web/browser pages).
+ *
+ * --shell-top-offset lets full-viewport pages (/auth, /reset-password)
+ * center within the scroll area below the in-flow 48px bar instead of
+ * the full 100vh. */
+:root {
+  --shell-top-offset: 0px;
+}
+.desktop-shell {
+  --shell-top-offset: 48px; /* h-12 GlobalTopBar */
+}
+/* Reset only the shell's OWN content main (direct child of the flex row).
+   Scoped with `> div > main` so nested mains — e.g. the watch page's own
+   <main> (which lives inside this content main) — are NOT zeroed and can
+   apply their own top padding (pt-12) to clear the GlobalTopBar. */
+.desktop-shell > div > main {
+  padding-top: 0;
+}
+
+/* PageShell pages inside the desktop shell: the GlobalTopBar is in-flow
+   (h-12), not overlaying, so the website-header clearing math (pt-24/pt-32)
+   doesn't apply — but padding-top: 0 glues the page title to the bar. Give
+   shell-rendered PageShell pages their editorial gutter instead (specificity
+   0,2,1 beats both the rule above and the utility classes; other mains —
+   watch/player immersive layouts — stay at 0). */
+.desktop-shell main.page-shell {
+  padding-top: var(--desktop-main-pt);
+}
+.desktop-shell main.page-shell-hero {
+  padding-top: calc(var(--desktop-main-pt) + 0.5rem);
+}
+
+/* Home feed: on web the Header is fixed, so the anime branch needs pt-16 to
+   clear it. On desktop the GlobalTopBar is in-flow (reserves its own 48px) and
+   the shell main is padding-top:0, so any feed top-padding reads as a blank bar
+   — zero it there. The Hero (movie_tv branch) is full-bleed on both platforms. */
+.home-anime-feed {
+  padding-top: 4rem; /* pt-16 — clears the fixed web Header */
+}
+html.fs-desktop .home-anime-feed {
+  padding-top: 0;
+}
+
+/* ── Desktop couch-distance scaling ──
+ * Expert verdict Q3: scale the whole UI ~12.5% inside Electron. Implemented on
+ * <html> (html.fs-desktop) rather than .desktop-shell because rem-based
+ * Tailwind utilities resolve against the ROOT font-size, not any container.
+ * DesktopAppShell adds the class after mount; web/browser stays at 16px. */
+html.fs-desktop {
+  font-size: 18px;
+}
+
+/* ── Desktop hero height compensation ──
+ * The hero uses h-[90vh] which overflows below the visible fold when the
+ * in-flow 48px GlobalTopBar is present. Cap it so it sits within the
+ * scroll area. Web/browser pages are unaffected (no .fs-desktop class). */
+html.fs-desktop .hero-desktop {
+  max-height: calc(90vh - 48px);
+}
+
+/* ── Tabular nums for data displays ── */
+@layer utilities {
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* â”€â”€ Utility Classes â”€â”€ */
+@layer utilities {
+  .text-display-xs { font-size: var(--font-size-xs); line-height: var(--leading-normal); letter-spacing: var(--tracking-normal); }
+  .text-display-sm { font-size: var(--font-size-sm); line-height: var(--leading-normal); letter-spacing: var(--tracking-normal); }
+  .text-display-md { font-size: var(--font-size-md); line-height: var(--leading-normal); letter-spacing: var(--tracking-normal); }
+  .text-display-lg { font-size: var(--font-size-lg); line-height: var(--leading-tight); letter-spacing: var(--tracking-tight); }
+  .text-display-xl { font-size: var(--font-size-xl); line-height: var(--leading-tight); letter-spacing: var(--tracking-tight); }
+  .text-display-2xl { font-size: var(--font-size-2xl); line-height: var(--leading-tight); letter-spacing: var(--tracking-tight); }
+  .text-display-3xl { font-size: var(--font-size-3xl); line-height: var(--leading-tight); letter-spacing: var(--tracking-tight); }
+
+  .text-shadow-soft {
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+  }
+
+  .text-shadow-hero {
+    text-shadow: 0 2px 8px rgba(0, 0, 0, 0.6);
+  }
+
+  /* Warm gradient overlay for hero backdrop bottoms */
+  .gradient-overlay {
+    background: linear-gradient(
+      to bottom,
+      rgba(0, 0, 0, 0) 0%,
+      rgba(7, 7, 8, 0.4) 60%,
+      rgba(7, 7, 8, 0.9) 100%
+    );
+  }
+
+  /* Left-to-right gradient for hero text areas */
+  .gradient-hero-text {
+    background: linear-gradient(
+      to right,
+      rgba(7, 7, 8, 0.85) 0%,
+      rgba(7, 7, 8, 0.4) 70%,
+      rgba(7, 7, 8, 0) 100%
+    );
+  }
+
+  /* Glassmorphism â€” unified formula */
+  .glass {
+    background-color: rgba(14, 14, 17, 0.75) !important;
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid rgba(34, 34, 38, 0.3);
+  }
+
+  .glass-light {
+    background-color: rgba(34, 34, 38, 0.4);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid rgba(34, 34, 38, 0.2);
+  }
+
+  /* Ambient glow behind hero elements */
+  .ambient-glow {
+    background: radial-gradient(
+      ellipse 80% 60% at 50% 0%,
+      rgba(212, 162, 55, 0.12) 0%,
+      transparent 70%
+    );
+  }
+
+  /* Warm ambient glow (amber-based) */
+  .ambient-glow-warm {
+    background: radial-gradient(
+      ellipse 60% 50% at 50% 100%,
+      rgba(212, 162, 55, 0.06) 0%,
+      transparent 70%
+    );
+  }
+
+  /* Line clamp utilities */
+  .line-clamp-2 {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .line-clamp-3 {
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  /* Film grain overlay â€” static PNG for performance */
+  .film-grain {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    z-index: 9999;
+    opacity: 0.03;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E");
+    background-repeat: repeat;
+    background-size: 256px 256px;
+    /* Use will-change to GPU-composite */
+    will-change: transform;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .film-grain {
+      display: none;
+    }
+  }
+}
+
+/* â”€â”€ Performance â”€â”€ */
+@layer base {
+  img {
+    content-visibility: auto;
+  }
+}
+
+/* â”€â”€ Swiper overrides for Hero â”€â”€ */
+/* ── Swiper: stop mouse-drag from selecting cards instead of swiping ── */
+.swiper {
+  user-select: none;
+  -webkit-user-select: none;
+}
+/* Prevent native image drag (ghost image) stealing the swipe gesture. */
+.swiper img,
+.swiper .swiper-slide img {
+  -webkit-user-drag: none;
+  user-select: none;
+  pointer-events: none;
+}
+
+.hero-swiper .swiper-slide {
+  transition: opacity 0.8s ease !important;
+}
+
+.hero-swiper .swiper-pagination-bullet {
+  background: rgba(244, 244, 245, 0.3) !important;
+  opacity: 1 !important;
+  width: 8px !important;
+  height: 8px !important;
+  transition: all 0.3s ease !important;
+}
+
+.hero-swiper .swiper-pagination-bullet-active {
+  background: #D4A237 !important;
+  width: 28px !important;
+  border-radius: 4px !important;
+}
+
+.hero-swiper .swiper-button-prev,
+.hero-swiper .swiper-button-next {
+  color: rgba(244, 244, 245, 0.6) !important;
+  background: rgba(7, 7, 8, 0.4);
+  backdrop-filter: blur(8px);
+  width: 44px !important;
+  height: 44px !important;
+  border-radius: 50%;
+  border: 1px solid rgba(34, 34, 38, 0.3);
+  transition: all 0.3s ease;
+}
+
+.hero-swiper .swiper-button-prev:hover,
+.hero-swiper .swiper-button-next:hover {
+  color: #F4F4F5 !important;
+  background: rgba(7, 7, 8, 0.7);
+  transform: scale(1.05);
+}
+
+.hero-swiper .swiper-button-prev::after,
+.hero-swiper .swiper-button-next::after {
+  font-size: 16px !important;
+  font-weight: 700;
+}

@@ -1,0 +1,178 @@
+# `@movie-hub/mobile` — MOVIE HUB Mobile App
+
+Expo / React Native app for Android and iOS. Content discovery, watchlist &
+history, SQLite-backed downloads, and two playback paths: a direct-stream
+player built on expo-video (with a vendored MKV extractor) and a native
+hardened provider player powered by the `player-webview` Expo module.
+
+## Stack
+
+- **Expo SDK 55**, React Native 0.83, TypeScript.
+- **Native module:** `modules/player-webview` (Android Kotlin + iOS Swift) —
+  the hardened provider player.
+- **Downloads:** SQLite-backed download engine in `lib/download/` + a native
+  downloader injected into the Android/iOS projects at prebuild by the
+  `plugins/with-filmsnaps-downloader` config plugin.
+- **State:** shared watchlist/history from `@filmsnaps/shared`.
+- **Builds:** EAS build profiles (`development` / `preview` / `production`).
+
+## Layout
+
+```
+app/                      Expo Router routes (tabs, movie, tv, watch, download, history, …)
+components/               UI components
+  VideoWebView.tsx        Provider player host — injects the shared guard bundle, drives PlayerWebView
+  HevcPlayer.tsx          Direct-stream player — source probing/fallback, rebuffer watchdog,
+                          remembered-source promotion, adaptive buffer profiles
+  player/                 Player controls, server picker, episode rail, subtitles,
+                          ExpoVideoAdapter (expo-video PlayerAdapter implementation)
+modules/player-webview/   Native hardened player (Android + iOS)
+lib/
+  api.ts                  TMDB client
+  streamSelector.ts       Candidate link discovery + ranking across providers
+  streamValidator.ts      Range-probe validation — container-signature check before playback
+  streamPrefetch.ts       Stream cache for instant replay of a title
+  playerConfig.ts         Player tuning (JS + native knobs) with remote override —
+                          GET {API}/api/player-config; post-ship fixes without a store release
+  subtitleSearch.ts       Online subtitles — server /api/subtitles proxy runs the
+                          Subdl→Wyzie fallback chain (keys stay server-side); on
+                          double rate-limit the sheet shows "not found"
+  bufferProfiles.ts       Per-format ExoPlayer buffer profiles (start/rebuffer/forward targets)
+  lastWorkingSource.ts    Remembers the server URL that last played per title
+  networkMonitor.ts       On-device bandwidth measurement
+  perfMetrics.ts          Player perf session — emits optional anonymous watch
+                          metrics through the telemetry gate (plays only when
+                          enabled)
+  hevc.ts                 MKV/HEVC format detection helpers
+  nxshaApi.ts             NXSha provider API (AES-CBC request encoding)
+  download/               Download engine (manager, store, SQLite, native adapter)
+  watchHistory.ts         Watch progress/history
+  settings.tsx            App settings (incl. global `mode`: `movie_tv` | `anime`)
+  introDetect.ts          Skip-intro detection
+  anime/                  Anime mode: AniList search, MAL/AniList ID resolution
+                          (OTA-bundled `anime-map.json`), threaded into the player
+patches/                  (repo root) pnpm patch for expo-video@55.0.18 — vendored
+                          SecondarySeekHeadMatroskaExtractor, HTTP traffic diagnostics,
+                          JS-tunable knobs (MKV extractor kill switch, HTTP timeouts,
+                          default headers), sidecar-subtitle support
+```
+
+Playback pipeline: `watch/[...id]` resolves candidates (`streamSelector`) →
+probes/validates them on-device (`streamValidator`) → promotes the last
+working source (`lastWorkingSource`) → plays direct links through
+`HevcPlayer` (expo-video + the vendored MKV extractor), falling back to the
+sandboxed `VideoWebView` provider player when no direct link survives.
+
+## Run
+
+```bash
+# From repo root
+pnpm dev:mobile
+
+# Or from this dir
+pnpm start        # Expo dev server
+pnpm android      # expo run:android
+pnpm ios          # expo run:ios
+```
+
+## Build
+
+```bash
+# EAS builds
+eas build --platform android --profile preview
+eas build --platform android --profile production
+
+# Local native builds (requires Android/iOS toolchain)
+pnpm android
+pnpm ios
+```
+
+CI builds via `.github/workflows/mobile.yml`.
+
+## Player & security
+
+`components/VideoWebView.tsx` builds the consolidated protection bundle with
+`buildAllScriptsWithScriptlets()` from `@filmsnaps/shared` (15-layer guard +
+uBO scriptlets + provider cosmetic CSS) and injects it into the native
+`PlayerWebView`. The native module adds network-level filtering
+(`AdblockEngine.kt`, `shouldInterceptRequest`), navigation gating, a DOM
+sweeper, disable-devtool neutralization, and the home-escape guard. See
+[docs/security.md](../../docs/security.md).
+
+### Hard Mode Split (Anime mode)
+
+The app runs on a global `mode` (`movie_tv` | `anime`) from
+`lib/settings.tsx`. In **anime** mode, `VideoWebView` selects servers via
+`filterAnimeProviders(getEnabledProviders())` (allowlist: nxsha, screenscape,
+megaplay) and routes to **MegaPlay**, which is keyed by MAL/AniList IDs rather
+than TMDB. Each anime title is resolved to its IDs in `lib/anime/resolve.ts`
+(backed by the OTA-bundled `lib/anime/anime-map.json`), and a 410 response
+triggers automatic fallback to the alternate ID space (MAL ↔ AniList). Server
+selection is **per-title**, so a regular movie opened inside anime mode still
+gets its correct (non-anime) server set.
+
+## Downloads
+
+`lib/download/` implements the download engine:
+
+- `manager.ts` — download orchestration (queue, progress, resume).
+- `database.ts` / `store.ts` — SQLite-backed metadata store.
+- `nativeAdapter.ts` / `nativeBridge.ts` — bridge to the native downloader.
+- `useDownload*.ts` — React hooks over the engine.
+
+The native downloader (`FilmsnapsDownloadModule` Kotlin / Swift) is injected
+into the generated Android/iOS projects by `plugins/with-filmsnaps-downloader`
+during `expo prebuild`. Downloads persist across app restarts and surface in
+the Downloads screen.
+
+### File extension handling
+
+A downloaded file keeps the **real container extension** of the bytes actually
+written to disk (`.mkv`, `.mp4`, `.webm`, …), not a hard-coded default. The
+extension is resolved with a clear precedence:
+
+1. **JS-provided `extension`** — the download screen derives the extension from
+   the provider's file listing (e.g. `file.name.split(".").pop()` for falix)
+   and passes it through `enqueue({ extension })` → `buildFileName`. This wins
+   so the _temp_ file is created with the correct extension from the start.
+2. **Native response** — `FilmsnapsDownloadService.renameWithRealExtension`
+   derives the extension from the final HTTP response URL (after redirects)
+   plus the `Content-Type` header (`mimeToExt` maps `video/*` to extensions).
+   This is the backstop that handles providers whose listing hides the
+   real extension.
+3. **Fallback `.mp4`** — only used when neither of the above yields one.
+
+The resolved extension is emitted back to JS via the `onDownloadComplete`
+bridge event (`extension` + `fileName`), persisted in the download record, and
+used for the MediaStore `MIME_TYPE` at publish time — so the file appears with
+the correct icon and opens in the right player.
+
+> Note: providers like falix serve downloads from opaque tokenized URLs that
+> redirect, so the native response URL / `Content-Type` is not a reliable
+> extension source. For those providers the JS-provided `extension` (step 1)
+> is the authoritative fix.
+
+### Where downloaded files live
+
+To make offline videos **easy to find and play outside the app** (like a Chrome
+download) the app writes to the device's shared storage with **no permission
+prompt**:
+
+- **Android 10 (API 29) and later:** completed downloads are published into the
+  system **MediaStore `Downloads`** collection under a `Filmsnaps/` subfolder.
+  They appear in the system Downloads app, can be opened in any video player
+  (e.g. VLC via "Open with"), and **survive app uninstall**.
+- **Older Android (API 24–28):** files stay in the app-private
+  `getExternalFilesDir` download directory — still no permission, but only
+  visible inside FilmSnaps.
+- **In-app playback** of the MediaStore file uses a small `OfflineFileProvider`
+  bridge (`content://com.filmsnaps.offline/...`) so the native `expo-video`
+  player can read the shared file without copying it.
+
+Deleting an item from the in-app Downloads screen removes the shared MediaStore
+entry as well, so used-space accounting stays accurate.
+
+## Feedback
+
+The settings page links to the deployed feedback portal (`@filmsnaps/feedback`),
+loaded in-app via webview.

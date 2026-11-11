@@ -1,0 +1,147 @@
+// lib/tmdb.server.ts
+import "server-only";
+
+const BASE = "https://api.themoviedb.org/3";
+const KEY = process.env.TMDB_API_KEY;
+
+function needsKey(): string {
+  if (!KEY) {
+    console.warn("[TMDB] API key is not configured. Set TMDB_API_KEY.");
+    return "";
+  }
+  return KEY;
+}
+
+interface GetMoviesOptions {
+  genreIds?: number[];
+  sortBy?: string;
+  yearStart?: number;
+  yearEnd?: number;
+  minRating?: number;
+  maxRating?: number;
+  language?: string;
+  page?: number;
+}
+interface GetTVOptions {
+  genreIds?: number[];
+  sortBy?: string;
+  yearStart?: number;
+  yearEnd?: number;
+  minRating?: number;
+  maxRating?: number;
+  language?: string;
+  page?: number;
+}
+/**
+ * Pick a sensible Data Cache TTL per TMDB endpoint shape.
+ * Details/seasons are effectively immutable for released content → 7d.
+ * Lists (trending/popular/upcoming) shift a few times a day → 10m.
+ * Everything else (discover, search, genres) → 1h.
+ *
+ * Uses Next.js's fetch-level `next: { revalidate }` (the stable Data Cache
+ * API, still current in Next 16 non-Cache-Components mode). Note: on pages
+ * that consume request-time APIs (`headers()`/`searchParams`) before this
+ * fetch is reached, the default `fetchCache: 'auto'` skips caching — that's
+ * acceptable; the cached pages are the static-ish RSC routes.
+ */
+function getRevalidate(path: string): number {
+  const detailOrSeason =
+    /^\/(movie|tv|person)\/\d+/.test(path) || /\/season\/\d+/.test(path);
+  if (detailOrSeason) return 604800; // 7 days
+  if (/(trending|popular|upcoming|top_rated)/.test(path)) return 600; // 10 min
+  return 3600; // 1 h
+}
+
+export async function tmdb(path: string) {
+  const apiKey = needsKey();
+  if (!apiKey) return { results: [] };
+
+  const separator = path.includes("?") ? "&" : "?";
+
+  try {
+    const res = await fetch(`${BASE}${path}${separator}api_key=${apiKey}`, {
+      next: { revalidate: getRevalidate(path) },
+    });
+
+    if (!res.ok) {
+      console.error("TMDB ERROR:", res.status, await res.text());
+      return { results: [] };
+    }
+
+    return res.json();
+  } catch (err) {
+    console.error("TMDB fetch error:", err);
+    return { results: [] };
+  }
+}
+
+export async function tmdbMovieMeta(id: string) {
+  return tmdb(`/movie/${id}`);
+}
+
+export async function tmdbMovieFull(id: string) {
+  return tmdb(
+    `/movie/${id}?append_to_response=videos,credits,similar,recommendations`,
+  );
+}
+export async function getMovieGenres() {
+  return tmdb("/genre/movie/list?language=en-US");
+}
+export async function getTvGenres() {
+  return tmdb("/genre/tv/list?language=en-US");
+}
+export async function tmdbTvMeta(id: string) {
+  return tmdb(`/tv/${id}?append_to_response=images,credits`);
+}
+
+export async function tmdbTvFull(id: string) {
+  return tmdb(
+    `/tv/${id}?append_to_response=videos,credits,similar,recommendations`,
+  );
+}
+export async function getMovies({
+  genreIds,
+  sortBy = "popularity.desc",
+  yearStart,
+  yearEnd,
+  minRating,
+  maxRating,
+  language,
+  page = 1,
+}: GetMoviesOptions) {
+  let path = `/discover/movie?sort_by=${sortBy}&page=${page}`;
+
+  if (genreIds?.length) path += `&with_genres=${genreIds.join(",")}`;
+  if (yearStart && yearEnd)
+    path += `&primary_release_date.gte=${yearStart}-01-01&primary_release_date.lte=${yearEnd}-12-31`;
+  if (minRating !== undefined) path += `&vote_average.gte=${minRating}`;
+  if (maxRating !== undefined) path += `&vote_average.lte=${maxRating}`;
+  if (language) path += `&with_original_language=${language}`;
+
+  return tmdb(path);
+}
+
+export async function getTVShows({
+  genreIds,
+  sortBy = "popularity.desc",
+  yearStart,
+  yearEnd,
+  minRating,
+  maxRating,
+  language,
+  page = 1,
+}: GetTVOptions) {
+  let path = `/discover/tv?sort_by=${sortBy}&page=${page}`;
+
+  if (genreIds?.length) path += `&with_genres=${genreIds.join(",")}`;
+  if (yearStart && yearEnd)
+    path += `&first_air_date.gte=${yearStart}-01-01&first_air_date.lte=${yearEnd}-12-31`;
+  if (minRating !== undefined) path += `&vote_average.gte=${minRating}`;
+  if (maxRating !== undefined) path += `&vote_average.lte=${maxRating}`;
+  if (language) path += `&with_original_language=${language}`;
+
+  return tmdb(path);
+}
+export async function tmdbTvSeasonMeta(id: string, seasonNumber: number) {
+  return tmdb(`/tv/${id}/season/${seasonNumber}`);
+}

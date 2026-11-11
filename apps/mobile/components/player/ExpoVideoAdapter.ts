@@ -1,0 +1,1161 @@
+/**
+ * ExpoVideoAdapter — wraps expo-video VideoPlayer into PlayerAdapter interface.
+ *
+ * Distinguishes user pause intent from transient seek/buffering states,
+ * guarantees automatic playback resumption after seeks, and provides
+ * robust multi-format duration reporting.
+ */
+
+import type { VideoPlayer } from "expo-video";
+import { requireNativeModule } from "expo-modules-core";
+import { getPlayerTuning } from "../../lib/playerConfig";
+import type { PlayerAdapter, AudioTrackInfo, SubtitleTrackInfo } from "./types";
+
+/** Native expo-video module — hosts probeStream + setSubtitleOffset (patch).
+ *  Resolved defensively: requireNativeModule() throws when the module is not
+ *  registered (native/OTA mismatch), and a throw at module scope happens during
+ *  import — before any ErrorBoundary exists — so it white-screens the app.
+ *  Callers already use optional chaining (setSubtitleOffset?.), so a missing
+ *  module degrades to a no-op instead of a crash. */
+const ExpoVideoNativeModule = (() => {
+  try {
+    return requireNativeModule("ExpoVideo") as {
+      setSubtitleOffset?: (ms: number) => void;
+      probeStream?: (
+        url: string,
+        headers: Record<string, string>,
+        timeoutMs: number,
+      ) => Promise<Record<string, any>>;
+    };
+  } catch (e) {
+    console.warn("[ExpoVideoAdapter] ExpoVideo native module unavailable:", e);
+    return {} as {
+      setSubtitleOffset?: (ms: number) => void;
+      probeStream?: (
+        url: string,
+        headers: Record<string, string>,
+        timeoutMs: number,
+      ) => Promise<Record<string, any>>;
+    };
+  }
+})();
+// Sidecar-subtitle functions live on the player SharedObject (patch adds them
+// inside Class("VideoPlayer")), so they're called on the player instance.
+const playerWithSidecarApi = (player: VideoPlayer) =>
+  player as VideoPlayer & {
+    addSidecarSubtitle?: (
+      uri: string,
+      mimeType: string,
+      language: string | null,
+      label: string | null,
+    ) => Promise<string | null>;
+    clearSidecarSubtitles?: () => void;
+  };
+
+export class ExpoVideoAdapter implements PlayerAdapter {
+  private _userPaused = false;
+  private _isMuted = false;
+  private _volume = 1;
+  private _rate = 1;
+  private _isSeeking = false;
+  private _targetSeekTime = 0;
+  private _seekGeneration = 0;
+  /** Seek generation whose "suppressing pre-seek update" line was last logged. */
+  private _suppressLogGen = -1;
+  private _seekSafetyTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 12s give-up: emits the REAL position if a held seek never resolves. */
+  private _seekBackstopTimer: ReturnType<typeof setTimeout> | null = null;
+
+  private timeListeners: ((time: number, duration: number) => void)[] = [];
+  private playPauseListeners: ((isPaused: boolean) => void)[] = [];
+  private bufferingListeners: ((isBuffering: boolean) => void)[] = [];
+  private errorListeners: ((error: string) => void)[] = [];
+  /** Native statusChange (idle/loading/readyToPlay/error) — [watchperf] playerReady. */
+  private statusListeners: ((status: string) => void)[] = [];
+  /** Timestamp of the last non-"off" subtitle selection — used to attribute errors. */
+  private subtitleEnabledAt = 0;
+  private endedListeners: (() => void)[] = [];
+  /** True once the natural end of media was reported for the current source. */
+  private endedEmitted = false;
+  private currentError: string | null = null;
+  private subs: { remove(): void }[] = [];
+  private errorCheckTimer: ReturnType<typeof setInterval> | null = null;
+  private metadataLoaded = false;
+  private lastProgressTime = Date.now();
+  /** Timestamp of when the player first looked stuck (0 = not stuck). */
+  private stuckSince = 0;
+  private isProbeValidated = false;
+  private estimatedSizeBytes: number | undefined = undefined;
+  private destroyed = false;
+  /** Latched after the native shared object was released (detach once, log once). */
+  private _nativeDetached = false;
+  /** Set while the app is backgrounded — playback must stay stopped (see setAppBackgrounded). */
+  private _appBackgrounded = false;
+  /**
+   * Helper to determine if a reported currentTime represents a true seek landing
+   * vs transient pre-seek residue (e.g. 0s, 0.14s, 0.17s while buffering).
+   */
+  private isSeekResolved(time: number): boolean {
+    if (!this._isSeeking) return true;
+    const target = this._targetSeekTime;
+    // Landed = reported position genuinely AT the target. The old
+    // `diff <= 60 || time >= target - 30` ALSO matched the still-playing
+    // PRE-seek position (a +10s tap leaves it 10s short of the target), so
+    // the seek resolved instantly and the UI bounced optimistic → old → new.
+    // ExoPlayer seeks exactly, so ±3s around the target is a safe landing
+    // window; the 5s safety timer un-sticks anything weirder.
+    // Near-zero reports while a deeper target is pending are pre-seek
+    // residue, never a landing — without this, a seek to ≤15s "resolved"
+    // at 0s and the bar dropped to 0% until the chunk loaded.
+    if (time <= 2 && target >= time + 3) return false;
+    return target <= 15 ? time <= target + 3 : Math.abs(time - target) <= 3;
+  }
+
+  constructor(private player: VideoPlayer) {
+    // Initial user intent is to play
+    this._userPaused = !player.playing;
+    // [Q] pinpoint: epoch of construction (≈ sourceSet) so native status
+    // lines can be correlated with render/commit/effect [Q] lines.
+    console.log(`[Q] adapter-ctor status=${player.status} t=${Date.now()}`);
+
+    // 1. Time updates
+    this.subs.push(
+      player.addListener("timeUpdate", (update) => {
+        try {
+          if (!this.nativeAlive()) return;
+          // No frames exist before the source is actually open — suppress
+          // pre-ready positions (e.g. the preset resume point while still
+          // loading) so a dead source can never look like one that plays.
+          if (this.getStatus() !== "readyToPlay") return;
+          const time = Number.isFinite(update.currentTime)
+            ? Math.max(0, update.currentTime)
+            : 0;
+          const dur = this.getDuration();
+
+          if (this._isSeeking) {
+            // A real timeUpdate arriving while playing (readyToPlay + playing)
+            // means the seek has resolved only if it satisfies isSeekResolved(time).
+            // Suppresses transient 0s, 0.14s, 0.17s pre-seek residue while buffering.
+            if (
+              this.getStatus() === "readyToPlay" &&
+              this.isPlaying() &&
+              this.isSeekResolved(time)
+            ) {
+              this._isSeeking = false;
+            } else {
+              // Still resolving — suppress transient/stale values. One log per
+              // seek shows the pre-seek updates the UI must NOT display.
+              if (this._suppressLogGen !== this._seekGeneration) {
+                this._suppressLogGen = this._seekGeneration;
+                console.log(
+                  `[Bar] adapter hold residue t=${time.toFixed(2)} target=${this._targetSeekTime} status=${this.getStatus()} playing=${this.isPlaying()}`,
+                );
+              }
+              return;
+            }
+          }
+
+          if (this.maybeEmitEnded()) return;
+          this.timeListeners.forEach((l) => l(time, dur));
+        } catch (e) {
+          this.onNativeError(e);
+        }
+      }),
+    );
+
+    // 2. Native playing state changes
+    this.subs.push(
+      player.addListener("playingChange", (update) => {
+        try {
+          if (!this.nativeAlive()) return;
+
+          // While backgrounded, native playing transitions are leftovers from
+          // play() calls issued before the background pause took effect — squash
+          // them. Without this, the isPlaying=true branch below clears
+          // _userPaused and the stall-retry resurrects playback while the user
+          // is away (JS event callbacks keep running in the background; JS
+          // timers do not).
+          if (this._appBackgrounded) {
+            if (update.isPlaying) {
+              this.pause();
+            }
+            return;
+          }
+          if (update.isPlaying) {
+            this.bufferingListeners.forEach((l) => l(false));
+            this._userPaused = false;
+            this.playPauseListeners.forEach((l) => l(false));
+          } else {
+            if (this._userPaused) {
+              this.playPauseListeners.forEach((l) => l(true));
+            } else if (this.maybeEmitEnded()) {
+              // Natural end — do NOT flag buffering and do NOT retry play().
+            } else {
+              this.bufferingListeners.forEach((l) => l(true));
+              this.resumePlay("playingChange-stall-retry");
+            }
+          }
+        } catch (e) {
+          this.onNativeError(e);
+        }
+      }),
+    );
+
+    // 3. Status changes (loading, readyToPlay, erroring, etc.)
+    this.subs.push(
+      player.addListener("statusChange", (status) => {
+        try {
+          if (!this.nativeAlive()) return;
+
+          console.log(`[Q] native-status ${status.status} t=${Date.now()}`);
+          const isBuffering = status.status === "loading";
+          this.bufferingListeners.forEach((l) => l(isBuffering));
+          this.statusListeners.forEach((l) => l(status.status));
+
+          const curTime = this.getCurrentTimeSafe();
+          const curDur = this.getDurationSafe();
+
+          // Re-announce position/duration once the source is actually open
+          if (
+            status.status === "readyToPlay" &&
+            !this._isSeeking &&
+            curTime > 0
+          ) {
+            this.timeListeners.forEach((l) => l(curTime, curDur));
+          }
+
+          // Track if metadata is available (duration > 0 means metadata parsed)
+          if (curDur > 0) {
+            this.metadataLoaded = true;
+          }
+
+          // Track progress (currentTime > 0 means frames are decoding)
+          if (curTime > 0) {
+            this.lastProgressTime = Date.now();
+          }
+
+          // Emit time/duration when stream is ready
+          if (status.status === "readyToPlay") {
+            this.metadataLoaded = true;
+            this.stuckSince = 0;
+            this.currentError = null;
+            this.lastProgressTime = Date.now();
+
+            const dur = this.getDuration();
+            const time = curTime;
+
+            if (dur > 0) {
+              if (this._isSeeking) {
+                if (this.isSeekResolved(time)) {
+                  this._isSeeking = false;
+                  this.timeListeners.forEach((l) => l(time, dur));
+                }
+              } else if (time > 0) {
+                this.timeListeners.forEach((l) => l(time, dur));
+              }
+            } else {
+              // HEVC/MKV: duration not yet parsed — poll for it with exponential backoff
+              this.pollForMetadata(this.estimatedSizeBytes);
+            }
+
+            if (!this._userPaused) {
+              this.resumePlay("readyToPlay");
+            }
+          }
+
+          // expo-video emits "error" status with an error field
+          if (status.status === "error" || (status as any).error) {
+            const rawErr = (status as any).error ?? "Playback error";
+            const err =
+              typeof rawErr === "string"
+                ? rawErr
+                : (rawErr?.message ?? "Playback error");
+            const errorType = this.classifyError(err);
+            this.currentError = this.errorMessageForType(errorType, err);
+            const currentErr = this.currentError;
+            console.log(
+              "[ExpoVideo] statusError raw=",
+              typeof rawErr === "string" ? rawErr : JSON.stringify(rawErr),
+              " classified=",
+              currentErr,
+              " st=",
+              this.getStatus(),
+              " pos=",
+              curTime,
+              " dur=",
+              curDur,
+              " tracks=",
+              this.getAudioTracks().length,
+            );
+            this.errorListeners.forEach((l) => l(currentErr));
+          }
+        } catch (e) {
+          this.onNativeError(e);
+        }
+      }),
+    );
+
+    // 4. Source changes
+    this.subs.push(
+      player.addListener("sourceChange", () => {
+        if (!this.nativeAlive()) return;
+        this.currentError = null;
+        this.stuckSince = 0;
+        this.metadataLoaded = false;
+        this.endedEmitted = false;
+        this.lastProgressTime = Date.now();
+        if (!this._userPaused) {
+          this.resumePlay("sourceChange");
+        }
+      }),
+    );
+
+    // 5. Stuck detection with progressive timeout & poll-driven time updates
+    this.startStuckDetection();
+  }
+
+  /**
+   * expo-video's VideoPlayer is a shared object: once released, ANY property
+   * read throws ERR_USING_RELEASED_SHARED_OBJECT ("Cannot use shared object
+   * that was already released") — `?.` does NOT help because the JS reference
+   * is still non-null (Sentry 7826350905: getAudioTracks/getDuration in the
+   * render path). On a release error we detach (this.player = null) so every
+   * later optional chain short-circuits instead of throwing again.
+   */
+  private onNativeError(e: unknown): void {
+    const msg = String((e as any)?.message ?? e);
+    const released =
+      msg.includes("released") ||
+      (e as any)?.code === "ERR_USING_RELEASED_SHARED_OBJECT";
+    if (released) {
+      if (!this._nativeDetached) {
+        this._nativeDetached = true;
+        console.warn(
+          "[ExpoVideoAdapter] VideoPlayer shared object released — detaching native access",
+        );
+      }
+      this.player = null as any;
+    } else {
+      console.warn("[ExpoVideoAdapter] native player access failed:", e);
+    }
+  }
+
+  /** Native read; null/released player → `fallback` (never throws). */
+  private safeRead<T>(read: (p: VideoPlayer) => T, fallback: T): T {
+    const p = this.player;
+    if (this.destroyed || !p) return fallback;
+    try {
+      return read(p);
+    } catch (e) {
+      this.onNativeError(e);
+      return fallback;
+    }
+  }
+
+  /** Native write; null/released player → no-op (never throws). */
+  private safeWrite(write: (p: VideoPlayer) => void): void {
+    const p = this.player;
+    if (this.destroyed || !p) return;
+    try {
+      write(p);
+    } catch (e) {
+      this.onNativeError(e);
+    }
+  }
+
+  /**
+   * Entry guard for native event listeners & timers: false when destroyed or
+   * the shared object was released (a probe read detaches, so the rest of the
+   * callback's `this.player?.x` reads short-circuit on null).
+   */
+  private nativeAlive(): boolean {
+    const p = this.player;
+    if (this.destroyed || !p) return false;
+    try {
+      void p.status;
+      return true;
+    } catch (e) {
+      this.onNativeError(e);
+      return false;
+    }
+  }
+
+  /** Safely read status without throwing on a released shared object. */
+  private getStatus(): string | null {
+    return this.safeRead((p) => p.status, null);
+  }
+
+  /** Safely check if playing without throwing on a released shared object. */
+  private isPlaying(): boolean {
+    return this.safeRead((p) => Boolean(p.playing), false);
+  }
+
+  /** Safely read current time without throwing on a released shared object. */
+  private getCurrentTimeSafe(): number {
+    return this.safeRead(
+      (p) => (Number.isFinite(p.currentTime) ? Math.max(0, p.currentTime) : 0),
+      0,
+    );
+  }
+
+  /** Safely read duration without throwing on a released shared object. */
+  private getDurationSafe(): number {
+    return this.safeRead(
+      (p) => (Number.isFinite(p.duration) ? Math.max(0, p.duration) : 0),
+      0,
+    );
+  }
+
+  /** Safely read player error without throwing on a released shared object. */
+  private getPlayerError(): any {
+    return this.safeRead((p) => (p as any)?.error, null);
+  }
+
+  /**
+   * Set estimated file size in bytes for dynamic metadata parsing timeout.
+   */
+  setEstimatedSizeBytes(bytes?: number) {
+    this.estimatedSizeBytes = bytes;
+  }
+
+  /**
+   * Set whether this URL was validated by the GET Range probe.
+   */
+  setProbeValidated(validated: boolean) {
+    this.isProbeValidated = validated;
+  }
+
+  /**
+   * Reset stuck detection state — called when retrying the same URL.
+   */
+  resetStuckDetection() {
+    this.metadataLoaded = false;
+    this.lastProgressTime = Date.now();
+    this.stuckSince = 0;
+    this.stopStuckDetection();
+    this.startStuckDetection();
+  }
+
+  private startStuckDetection() {
+    this.errorCheckTimer = setInterval(() => {
+      try {
+        if (!this.nativeAlive()) return;
+
+        const dur = this.getDuration();
+        const time = this.getCurrentTimeSafe();
+
+        // Sync duration & progress if player is now populated
+        if (dur > 0) {
+          this.metadataLoaded = true;
+        }
+        if (time > 0) {
+          this.lastProgressTime = Date.now();
+          this.stuckSince = 0;
+        }
+
+        // Poll-driven time update: fires regardless of whether timeUpdate
+        // events are reliable for this container/codec combination.
+        if (!this._isSeeking && time > 0 && dur > 0) {
+          if (this.maybeEmitEnded()) return;
+          this.timeListeners.forEach((l) => l(time, dur));
+        }
+
+        // Check for native player errors
+        const err = this.getPlayerError();
+        if (err && err !== this.currentError) {
+          const errMsg =
+            typeof err === "string" ? err : (err?.message ?? "Playback error");
+          const errorType = this.classifyError(errMsg);
+          this.currentError = this.errorMessageForType(errorType, errMsg);
+          const currentErr = this.currentError;
+          // DIAG (offline playback audit): poll-path player.error, raw.
+          console.log(
+            "[ExpoVideo] polledError raw=",
+            typeof err === "string" ? err : JSON.stringify(err),
+            " classified=",
+            currentErr,
+            " st=",
+            this.getStatus(),
+            " pos=",
+            time,
+          );
+          this.errorListeners.forEach((l) => l(currentErr));
+        }
+
+        const status = this.getStatus();
+
+        // Watchdog timeout for dead or stalling connections (hung sockets / throttled mirrors)
+        // 1. If probe-validated, allow 10s for heavy container headers before fallback.
+        // 2. If unvalidated, allow 8.5s before falling back to a pre-validated link.
+        const noMetadataTimeout = this.isProbeValidated ? 10000 : 8500;
+
+        if (status === "loading") {
+          if (!this.metadataLoaded && this.getDurationSafe() <= 0) {
+            if (this.stuckSince === 0) {
+              this.stuckSince = Date.now();
+            } else if (Date.now() - this.stuckSince > noMetadataTimeout) {
+              this.currentError =
+                "Stream connection stalled — switching to backup source";
+              const currentErr = this.currentError;
+              this.errorListeners.forEach((l) => l(currentErr));
+              this.stopStuckDetection();
+              return;
+            }
+          }
+        } else {
+          // Not loading — reset stuck timer
+          this.stuckSince = 0;
+        }
+      } catch (e) {
+        this.onNativeError(e);
+      }
+    }, 500);
+  }
+
+  /**
+   * Poll for non-zero duration after readyToPlay fires with dur=0.
+   * Uses exponential backoff and scales timeout ceiling by file size.
+   */
+  private pollForMetadata(estimatedSizeBytes?: number) {
+    let attempts = 0;
+    const sizeBytes = estimatedSizeBytes ?? this.estimatedSizeBytes ?? 0;
+    const sizeGB = sizeBytes / 1024 ** 3;
+    // Scale ceiling: ~5s baseline, +1s per GB beyond 2GB, capped at 15s.
+    const maxWaitMs = Math.min(15000, 5000 + Math.max(0, sizeGB - 2) * 1000);
+    const startedAt = Date.now();
+
+    const poll = () => {
+      if (!this.nativeAlive()) return;
+      const dur = this.getDuration();
+      if (dur > 0) {
+        this.metadataLoaded = true;
+        const time = this.getCurrentTimeSafe();
+
+        // Hold duration-only polls back during an active seek — a ~0 time
+        // here would reach the bar unfiltered.
+        if (!this._isSeeking) {
+          this.timeListeners.forEach((l) => l(time, dur));
+        }
+        return;
+      }
+
+      if (Date.now() - startedAt >= maxWaitMs) {
+        console.warn(
+          `[ExpoVideoAdapter] Metadata polling timed out (${maxWaitMs}ms)`,
+        );
+        // Surface a soft error so HevcPlayer's fallback logic can act
+        this.errorListeners.forEach((l) => l("Metadata parsing timed out"));
+        return;
+      }
+
+      attempts++;
+      // Backoff: 100ms -> 150ms -> 225ms -> ... capped at 500ms
+      const delay = Math.min(
+        500,
+        Math.round(100 * Math.pow(1.5, Math.min(attempts, 6))),
+      );
+      setTimeout(poll, delay);
+    };
+
+    poll();
+  }
+
+  private stopStuckDetection() {
+    if (this.errorCheckTimer) {
+      clearInterval(this.errorCheckTimer);
+      this.errorCheckTimer = null;
+    }
+  }
+
+  /**
+   * Classify error type for differentiated handling.
+   * - extractor: format not recognized by any ExoPlayer extractor
+   * - network: 403/404/timeout (may be temporary)
+   * - unknown: other errors
+   */
+  private classifyError(
+    message: string,
+  ): "extractor" | "audio_codec" | "network" | "unknown" {
+    const lower = message.toLowerCase();
+
+    // Audio sink / codec / decoder errors
+    if (
+      lower.includes("audio") ||
+      lower.includes("audiosink") ||
+      lower.includes("decoderinitexception") ||
+      lower.includes("audio_track") ||
+      lower.includes("audio_capabilities") ||
+      lower.includes("dts") ||
+      lower.includes("truehd")
+    ) {
+      return "audio_codec";
+    }
+
+    // ExoPlayer extractor error
+    if (
+      lower.includes("extractor") ||
+      lower.includes("could not read the stream")
+    ) {
+      return "extractor";
+    }
+
+    // Network/HTTP errors
+    if (
+      /\b\d{3}\b/.test(message) ||
+      lower.includes("timeout") ||
+      lower.includes("network")
+    ) {
+      return "network";
+    }
+
+    // DRM errors
+    if (lower.includes("drm") || lower.includes("widevine")) {
+      return "network";
+    }
+
+    return "unknown";
+  }
+
+  /**
+   * Map classified error type to user-facing message.
+   */
+  private errorMessageForType(
+    type: "extractor" | "audio_codec" | "network" | "unknown",
+    original: string,
+  ): string {
+    if (type === "audio_codec") {
+      return "Audio decoder unsupported or audio stream failed. Try switching audio track or stream source.";
+    }
+    if (type === "extractor") {
+      return "Stream format not supported by player (extractor error)";
+    }
+    if (type === "network") {
+      return (
+        "Network error — server returned " +
+        (/\b\d{3}\b/.exec(original)?.[0] ?? "an error status")
+      );
+    }
+    return original;
+  }
+
+  /**
+   * Report the natural end of media exactly once per source. A user pause
+   * near the end is NOT an end — they may still seek back.
+   */
+  private maybeEmitEnded(): boolean {
+    if (this.endedEmitted || this.destroyed || this._userPaused) return false;
+    const dur = this.getDuration();
+    const time = Number.isFinite(this.player?.currentTime)
+      ? this.player?.currentTime
+      : 0;
+    if (dur > 0 && time >= dur - 1) {
+      this.endedEmitted = true;
+      this.endedListeners.forEach((l) => l());
+      return true;
+    }
+    return false;
+  }
+
+  hasError(): boolean {
+    return this.currentError !== null;
+  }
+
+  clearError(): void {
+    this.currentError = null;
+  }
+
+  onError(cb: (error: string) => void): () => void {
+    this.errorListeners.push(cb);
+    return () => {
+      this.errorListeners = this.errorListeners.filter((l) => l !== cb);
+    };
+  }
+
+  onEnded(cb: () => void): () => void {
+    this.endedListeners.push(cb);
+    return () => {
+      this.endedListeners = this.endedListeners.filter((l) => l !== cb);
+    };
+  }
+
+  /** Internal auto-resume — logs a reason so a background-resume bug can be
+   *  traced to its exact call site ([FS-BG] diagnosis). */
+  private resumePlay(reason: string) {
+    this.safeWrite((p) => p.play());
+  }
+
+  setAppBackgrounded(backgrounded: boolean) {
+    this._appBackgrounded = backgrounded;
+    // Entering background while the player is still playing — the AppState
+    // pause raced ahead of the native transition. Stop it here.
+    if (backgrounded && this.safeRead((p) => p.playing, false)) {
+      this.pause();
+    }
+  }
+
+  play() {
+    this._userPaused = false;
+    this.safeWrite((p) => p.play());
+    this.playPauseListeners.forEach((l) => l(false));
+    this.bufferingListeners.forEach((l) => l(false));
+  }
+
+  pause() {
+    this._userPaused = true;
+    this.safeWrite((p) => p.pause());
+    this.playPauseListeners.forEach((l) => l(true));
+    // A paused player is not buffering. Without this, a pause landing while a
+    // stall's buffering(true) is pending (e.g. the background pause squashing
+    // the transitions that would normally clear it) leaves the overlay's
+    // play button stuck on the loading spinner.
+    this.bufferingListeners.forEach((l) => l(false));
+  }
+
+  /** True while a seek is in flight (target requested but not yet resolved). */
+  isSeeking(): boolean {
+    return this._isSeeking;
+  }
+
+  seek(time: number) {
+    if (!Number.isFinite(time) || time < 0) return;
+    const dur = this.getDuration();
+    const clamped =
+      dur > 0 ? Math.max(0, Math.min(dur, time)) : Math.max(0, time);
+
+    const myGeneration = ++this._seekGeneration;
+    this._isSeeking = true;
+    this._targetSeekTime = clamped;
+    this.bufferingListeners.forEach((l) => l(true));
+
+    // Optimistically reflect the target position immediately so the UI
+    // doesn't visually snap back while the real seek resolves.
+    this.timeListeners.forEach((l) => l(clamped, dur));
+
+    try {
+      if (this.player) this.player.currentTime = clamped;
+    } catch (e) {
+      console.warn("[ExpoVideoAdapter] seek error:", e);
+    }
+
+    if (!this._userPaused) {
+      this.resumePlay("seek");
+    }
+
+    // Secondary seek reinforcement at 400ms in case ExoPlayer's OkHttp connection
+    // needed a re-trigger on initial Range setup
+    setTimeout(() => {
+      try {
+        if (
+          this._seekGeneration === myGeneration &&
+          this._isSeeking &&
+          this.nativeAlive()
+        ) {
+          const cur = this.getCurrentTimeSafe();
+          if (
+            this.getStatus() === "readyToPlay" &&
+            Math.abs(cur - clamped) > 15
+          ) {
+            this.safeWrite((p) => {
+              p.currentTime = clamped;
+            });
+            if (!this._userPaused) this.resumePlay("seek-reinforce");
+          }
+        }
+      } catch (e) {
+        this.onNativeError(e);
+      }
+    }, 400);
+
+    if (this._seekSafetyTimer) clearTimeout(this._seekSafetyTimer);
+    if (this._seekBackstopTimer) clearTimeout(this._seekBackstopTimer);
+    this._seekSafetyTimer = setTimeout(() => {
+      try {
+        // Only clear if a newer seek hasn't superseded this one
+        if (this._seekGeneration !== myGeneration) return;
+        if (!this.nativeAlive()) return;
+        const actualTime = this.getCurrentTimeSafe() || clamped;
+        const landed = this.isSeekResolved(actualTime);
+        if (landed) {
+          this._isSeeking = false;
+          this.timeListeners.forEach((l) => l(actualTime, this.getDuration()));
+        } else {
+          // Slow chunk: keep the optimistic target on screen AND keep
+          // `_isSeeking` so native ~0 residue stays suppressed — force-
+          // clearing here let the next native tick through and the bar
+          // jumped to 0% until the chunk loaded. The 12s backstop gives up
+          // and reports the real position if the seek never resolves.
+          console.log(
+            `[Bar] seek safety held t=${actualTime?.toFixed(2)} target=${clamped}`,
+          );
+          this.timeListeners.forEach((l) => l(clamped, this.getDuration()));
+          this._seekBackstopTimer = setTimeout(() => {
+            try {
+              if (this.destroyed || this._seekGeneration !== myGeneration) return;
+              if (!this.nativeAlive()) return;
+              const finalTime = this.getCurrentTimeSafe() || clamped;
+              console.warn(
+                `[Bar] seek backstop t=${finalTime} target=${clamped} (seek never resolved)`,
+              );
+              this.timeListeners.forEach((l) => l(finalTime, this.getDuration()));
+            } catch (e) {
+              this.onNativeError(e);
+            }
+          }, 7000);
+        }
+
+        // If the player failed to seek (stuck near 0 while target was >10s),
+        // signal error to trigger fallback to a seekable backup stream
+        if (clamped > 10 && actualTime <= 2.0) {
+        console.warn(
+          `[ExpoVideoAdapter] Seek to ${clamped}s failed on unseekable stream (remained at ${actualTime}s)`,
+        );
+        this.errorListeners.forEach((l) =>
+          l("Stream does not support seeking — switching to backup source"),
+        );
+      }
+
+      if (!this._userPaused && !this.isPlaying()) {
+        this.resumePlay("seek-safety");
+      }
+    } catch (e) {
+      this.onNativeError(e);
+    }
+  }, 5000);
+  }
+
+  setVolume(volume: number) {
+    this._volume = Math.max(0, Math.min(1, volume));
+    this.safeWrite((p) => {
+      p.volume = this._volume;
+    });
+  }
+
+  setMuted(muted: boolean) {
+    this._isMuted = muted;
+    this.safeWrite((p) => {
+      p.muted = muted;
+    });
+  }
+
+  setPlaybackRate(rate: number) {
+    this._rate = rate;
+    // Null-safe post-destroy (2x-hold finalize can outlive the adapter).
+    this.safeWrite((p) => {
+      p.playbackRate = rate;
+    });
+  }
+
+  getCurrentTime(): number {
+    if (this._isSeeking && this._targetSeekTime > 0) {
+      return this._targetSeekTime;
+    }
+    return this.safeRead(
+      (p) => (Number.isFinite(p.currentTime) ? p.currentTime : 0),
+      0,
+    );
+  }
+
+  getDuration(): number {
+    return this.safeRead(
+      (p) => (Number.isFinite(p.duration) && p.duration > 0 ? p.duration : 0),
+      0,
+    );
+  }
+
+  /** Seconds of buffered-ahead content (expo-video bufferedPosition). */
+  getBufferedPosition(): number {
+    return this.safeRead(
+      (p) =>
+        Number.isFinite(p.bufferedPosition) && p.bufferedPosition > 0
+          ? p.bufferedPosition
+          : 0,
+      0,
+    );
+  }
+
+  isPaused(): boolean {
+    return this._userPaused;
+  }
+
+  isMuted(): boolean {
+    return this._isMuted;
+  }
+
+  getVolume(): number {
+    return this._volume;
+  }
+
+  getPlaybackRate(): number {
+    return this._rate;
+  }
+
+  getAudioTracks(): AudioTrackInfo[] {
+    // Null-safe: destroy() clears this.player, but listeners/chrome can call
+    // this until the new adapter lands — crashed the player UI with
+    // "Cannot read property 'availableAudioTracks' of null". Released-safe:
+    // a released shared object throws from the property read itself.
+    return this.safeRead((p) => {
+      const tracks = p.availableAudioTracks;
+      if (!tracks) return [];
+      return tracks.map((t, idx) => {
+        const id = t.id
+          ? String(t.id)
+          : t.language
+            ? `${t.language}-${idx}`
+            : `track-${idx}`;
+        return {
+          id,
+          label: t.label || t.language || `Audio Track ${idx + 1}`,
+          language: t.language || undefined,
+        };
+      });
+    }, []);
+  }
+
+  setAudioTrack(trackId: string) {
+    this.safeWrite((p) => {
+      const tracks = p.availableAudioTracks;
+      const match = tracks?.find((t, idx) => {
+        const id = t.id
+          ? String(t.id)
+          : t.language
+            ? `${t.language}-${idx}`
+            : `track-${idx}`;
+        return id === trackId || (t.id && String(t.id) === trackId);
+      });
+      if (match) {
+        p.audioTrack = match;
+      }
+    });
+  }
+
+  getSelectedAudioTrackId(): string | null {
+    return this.safeRead((p) => {
+      const t = p.audioTrack;
+      if (!t) return null;
+      const tracks = p.availableAudioTracks;
+      const idx = tracks ? tracks.indexOf(t) : 0;
+      return t.id
+        ? String(t.id)
+        : t.language
+          ? `${t.language}-${idx >= 0 ? idx : 0}`
+          : `track-${idx >= 0 ? idx : 0}`;
+    }, null);
+  }
+
+  getSubtitleTracks(): SubtitleTrackInfo[] {
+    // [SubPerf] This read synchronizes with the (busy) main thread — if it's
+    // slow it will show up here on render paths.
+    const t0 = Date.now();
+    // Null-safe: chrome can read tracks after destroy() nulled this.player —
+    // this was the "availableSubtitleTracks of null" ErrorBoundary crash.
+    const tracks = this.safeRead((p) => p.availableSubtitleTracks, null);
+    const dt = Date.now() - t0;
+    if (dt > 30) {
+    }
+    if (!tracks) return [];
+    return tracks.map((t) => {
+      const id = t.id ?? t.language ?? "off";
+      // Sidecar tracks merged via MergingMediaSource report ids like
+      // "1:sidecar_1" (child-index prefix + our stable native id).
+      const isExternal = id.includes("sidecar_");
+      return {
+        id,
+        // External: prefer our human label ("Online · <release name>") which
+        // expo-video exposes as `name`; embedded: the display language label.
+        label: isExternal
+          ? t.name || t.label || t.language || "Subtitle Track"
+          : t.label || t.language || "Subtitle Track",
+        language: t.language || undefined,
+        isExternal,
+      };
+    });
+  }
+
+  setSubtitleTrack(trackId: string) {
+    this.safeWrite((p) => {
+      if (trackId === "off") {
+        this.subtitleEnabledAt = 0;
+        p.subtitleTrack = null;
+        return;
+      }
+      const tracks = p.availableSubtitleTracks;
+      const match = tracks.find((t) => (t.id ?? t.language) === trackId);
+      this.subtitleEnabledAt = match ? Date.now() : 0;
+      p.subtitleTrack = match ?? null;
+    });
+  }
+
+  getSelectedSubtitleTrackId(): string | null {
+    // [SubPerf] Same main-thread synchronization risk as getSubtitleTracks.
+    const t0 = Date.now();
+    const current = this.safeRead((p) => p.subtitleTrack, null);
+    const dt = Date.now() - t0;
+    if (dt > 30) {
+    }
+    if (!current) return null;
+    return current.id ?? current.language ?? null;
+  }
+
+  subtitleJustEnabled(): boolean {
+    return (
+      this.subtitleEnabledAt > 0 &&
+      Date.now() - this.subtitleEnabledAt <
+        getPlayerTuning().subtitleErrorWindowMs
+    );
+  }
+
+  /**
+   * Adds an external subtitle file (downloaded srt/ass/vtt) as a sidecar
+   * MergingMediaSource. Re-prepares natively at the current position, then
+   * polls for the new track (matched by the stable "sidecar_N" id the native
+   * call returns) and selects it. Resolves with the selected track id, or
+   * null if the track didn't appear in time (playback continues).
+   */
+  async addExternalSubtitle(
+    uri: string,
+    mimeType: string,
+    language?: string,
+    label?: string,
+  ): Promise<string | null> {
+    const api = this.safeRead((p) => playerWithSidecarApi(p), null);
+    if (!api || typeof api.addSidecarSubtitle !== "function") {
+      throw new Error(
+        "Sidecar subtitles unsupported (expo-video patch missing)",
+      );
+    }
+    let trackId: string | null;
+    try {
+      trackId = await api.addSidecarSubtitle(
+        uri,
+        mimeType,
+        language ?? null,
+        label ?? null,
+      );
+    } catch (e) {
+      this.onNativeError(e);
+      return null;
+    }
+    if (!trackId) return null;
+
+    // After the re-prepare the merged source reloads asynchronously. The old
+    // 5s poll plus a 3-attempt retry loop in the caller STARVED the prepare:
+    // each retry called addSidecarSubtitle again, which re-prepared AGAIN,
+    // aborting the previous in-flight load — with ~10s HLSe loads the track
+    // never surfaced within any 5s window (device: bytes frozen across all
+    // four attempts, then "rollback also failed" because the rollback
+    // re-prepare aborted its predecessor too). ONE attach call + ONE long
+    // poll: the prepare is started exactly once and given time to finish.
+    const started = Date.now();
+    let lastStatus = "";
+    while (Date.now() - started < 20_000) {
+      await new Promise((r) => setTimeout(r, 250));
+      try {
+        lastStatus = String(this.safeRead((p) => p.status, ""));
+      } catch {}
+      const tracks = this.getSubtitleTracks();
+      // MergingMediaSource prefixes child-source format ids with the child
+      // index — our "sidecar_1" reports as "1:sidecar_1". Match both forms.
+      const match = tracks.find(
+        (t) => t.id === trackId || t.id.endsWith(`:${trackId}`),
+      );
+      if (match) {
+        this.setSubtitleTrack(match.id);
+        this.subtitleEnabledAt = Date.now();
+        console.log(
+          `[SubSync] sidecar track ${match.id} appeared after ${Date.now() - started}ms`,
+        );
+        return match.id;
+      }
+    }
+    console.log(
+      `[SubSync] sidecar track ${trackId} not surfaced within 20s (player status: ${lastStatus})`,
+    );
+    return null;
+  }
+
+  /** Drops all sidecar subtitles (takes effect at the next source prepare). */
+  clearExternalSubtitles(): void {
+    this.safeWrite((p) => {
+      playerWithSidecarApi(p).clearSidecarSubtitles?.();
+    });
+  }
+
+  onTimeUpdate(cb: (time: number, duration: number) => void): () => void {
+    this.timeListeners.push(cb);
+    return () => {
+      this.timeListeners = this.timeListeners.filter((l) => l !== cb);
+    };
+  }
+
+  onPlayPause(cb: (isPaused: boolean) => void): () => void {
+    this.playPauseListeners.push(cb);
+    return () => {
+      this.playPauseListeners = this.playPauseListeners.filter((l) => l !== cb);
+    };
+  }
+
+  onBuffering(cb: (isBuffering: boolean) => void): () => void {
+    this.bufferingListeners.push(cb);
+    return () => {
+      this.bufferingListeners = this.bufferingListeners.filter((l) => l !== cb);
+    };
+  }
+
+  onStatusChange(cb: (status: string) => void): () => void {
+    this.statusListeners.push(cb);
+    return () => {
+      this.statusListeners = this.statusListeners.filter((l) => l !== cb);
+    };
+  }
+
+  /**
+   * Shift embedded-subtitle timestamps. Applied natively in the vendored
+   * extractor (text-track block timecodes) — static, so it survives extractor
+   * recreation on source switches and covers every subsequent play.
+   */
+  setSubtitleOffset(ms: number): void {
+    try {
+      ExpoVideoNativeModule.setSubtitleOffset?.(ms);
+    } catch (e) {
+      console.warn("[ExpoVideoAdapter] setSubtitleOffset unavailable:", e);
+    }
+  }
+
+  destroy() {
+    if (this.destroyed) return; // Prevent double-destroy
+
+    this.destroyed = true;
+
+    // Clear all timers
+    if (this._seekSafetyTimer) clearTimeout(this._seekSafetyTimer);
+    if (this._seekBackstopTimer) clearTimeout(this._seekBackstopTimer);
+    if (this.errorCheckTimer) clearInterval(this.errorCheckTimer);
+
+    // Remove all subscriptions (remove() can throw on a released shared object)
+    this.subs.forEach((s) => {
+      try {
+        s.remove();
+      } catch {
+        /* released */
+      }
+    });
+    this.subs = [];
+
+    // Clear all listeners
+    this.timeListeners = [];
+    this.playPauseListeners = [];
+    this.bufferingListeners = [];
+    this.errorListeners = [];
+    this.endedListeners = [];
+
+    // Reset state
+    this.metadataLoaded = false;
+    this.stuckSince = 0;
+    this.lastProgressTime = Date.now();
+    this.currentError = null;
+
+    // Clear player reference
+    this.player = null as any;
+  }
+}

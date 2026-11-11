@@ -1,0 +1,1246 @@
+import React, {
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+  useMemo,
+} from "react";
+import {
+  View,
+  Text,
+  Animated,
+  TouchableOpacity,
+  useWindowDimensions,
+  Platform,
+  Share,
+} from "react-native";
+import { useLocalSearchParams, useFocusEffect } from "expo-router";
+import { useSafeNavigation } from "@/lib/navigation";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { Ionicons } from "@expo/vector-icons";
+import {
+  trackFeatureUsed,
+  trackDetailViewed,
+  getSessionId,
+} from "../../lib/telemetry";
+
+import { colors } from "../../theme/colors";
+import { getImageUrl, getTrailerKey, getContentEligibility } from "@filmsnaps/shared";
+import { ProgressiveImage } from "../../components/ProgressiveImage";
+import { FilmGrain } from "../../components/FilmGrain";
+import { HeroTint } from "../../components/HeroTint";
+import { useTVDetails } from "../../hooks/useTMDB";
+import { useMovieTheme } from "../../hooks/useMovieTheme";
+import { useSlotImpression } from "../../hooks/useSlotImpression";
+import { AdSlot } from "../../lib/ads";
+import {
+  beginDetail,
+  markDetailFirstFrame,
+  markDetailContentReady,
+} from "../../lib/detailMetrics";
+import { DETAIL_BACKDROP_SIZE } from "../../components/heroLayout";
+import { DETAIL_STALE_TIME } from "../../lib/detailQuery";
+import {
+  openDetail,
+  prepareDetail,
+  toDetailNavItem,
+} from "../../lib/openDetail";
+import { useQueryClient } from "@tanstack/react-query";
+import { useRouter } from "expo-router";
+import { MediaCarousel } from "../../components/MediaCarousel";
+import { CastCarousel } from "../../components/CastCarousel";
+import { TrailerModal } from "../../components/TrailerModal";
+import { DetailSkeleton } from "../../components/Skeletons";
+import { DownloadSheet } from "../../components/DownloadSheet";
+import { useMediaDownloadState } from "../../lib/download/context";
+import { SeasonPicker } from "../../components/SeasonPicker";
+import {
+  isBookmarked,
+  debouncedSaveBookmark,
+  debouncedRemoveBookmark,
+} from "../../lib/bookmarks";
+import { getResumePoint } from "../../lib/watchHistory";
+import { downloadToast } from "../../lib/download";
+import { prefetchArtwork } from "../../lib/prefetchArtwork";
+import {
+  prefetchStreams,
+  peekPrefetchStreams,
+  setStreamHandoff,
+} from "../../lib/streamPrefetch";
+import { resolvePlaybackProviderId } from "../../lib/resolvePlaybackProvider";
+import { beginDetailsTap } from "../../lib/perfMetrics";
+import {
+  holdEarlyPlayer,
+  hasEarlyPlayer,
+  releaseEarlyPlayer,
+} from "../../lib/earlyPlayerHolder";
+import { useSettings } from "../../lib/settings";
+import type { WatchProgress } from "../../lib/watchHistory";
+import * as Haptics from "expo-haptics";
+import { LinearGradient } from "expo-linear-gradient";
+import { resolveShowIds } from "../../lib/anime/resolve";
+
+export default function TVDetailScreen() {
+  const [trailerOpen, setTrailerOpen] = useState(false);
+  const [overviewExpanded, setOverviewExpanded] = useState(false);
+  const routeParams = useLocalSearchParams<{
+    id: string;
+    title?: string;
+    poster_path?: string;
+    backdrop_path?: string;
+    vote_average?: string;
+    release_date?: string;
+    blurhash?: string;
+    mid?: string;
+    aid?: string;
+  }>();
+  const id = routeParams.id;
+  const nav = useSafeNavigation();
+  const router = useRouter();
+  const queryClient = useQueryClient();
+  const insets = useSafeAreaInsets();
+  const { height: SCREEN_HEIGHT, width: SCREEN_WIDTH } = useWindowDimensions();
+  const { settings, loaded: settingsLoaded } = useSettings();
+  const { data, isLoading, isFetched, isError } = useTVDetails(id!);
+
+  // Params-first snapshot: header fields available before query resolves.
+  const paramsSnapshot = useMemo(() => {
+    if (
+      !routeParams.title &&
+      !routeParams.poster_path &&
+      !routeParams.backdrop_path
+    ) {
+      return null;
+    }
+    return {
+      title: routeParams.title ?? "",
+      poster_path: routeParams.poster_path ?? null,
+      backdrop_path: routeParams.backdrop_path ?? null,
+      vote_average: routeParams.vote_average
+        ? Number(routeParams.vote_average)
+        : null,
+      release_date: routeParams.release_date ?? null,
+      blurhash: routeParams.blurhash ?? null,
+    };
+  }, [
+    routeParams.title,
+    routeParams.poster_path,
+    routeParams.backdrop_path,
+    routeParams.vote_average,
+    routeParams.release_date,
+    routeParams.blurhash,
+  ]);
+
+  // Phase 2 instrumentation — once per screen mount.
+  const metricsStarted = useRef(false);
+  useEffect(() => {
+    if (metricsStarted.current || !id) return;
+    metricsStarted.current = true;
+    beginDetail("tv", String(id));
+  }, [id]);
+
+  useEffect(() => {
+    if (isFetched) markDetailContentReady();
+  }, [isFetched]);
+
+  // FIX 5: after details settle, warm SeasonPicker's initial season episodes.
+  const resumeSeasonRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!isFetched || !id) return;
+    const season = resumeSeasonRef.current ?? 1;
+    void queryClient.prefetchQuery({
+      queryKey: ["tv", id, "season", season],
+      queryFn: () =>
+        import("../../lib/api").then((m) =>
+          m.tmdbApi.getSeasonEpisodes(Number(id), season),
+        ),
+      staleTime: DETAIL_STALE_TIME,
+    });
+  }, [isFetched, id, queryClient]);
+
+  const BACKDROP_HEIGHT = Math.min(SCREEN_HEIGHT * 0.42, 350);
+  const POSTER_WIDTH = 104;
+  const POSTER_OVERLAP = 52;
+  const scrollY = useRef(new Animated.Value(0)).current;
+
+  const show = data ?? null;
+  const header = show
+    ? {
+        title: show.name || show.title || "",
+        poster_path: show.poster_path ?? null,
+        backdrop_path: show.backdrop_path ?? null,
+        vote_average: show.vote_average ?? null,
+        release_date: show.first_air_date ?? null,
+      }
+    : paramsSnapshot;
+  const title = header?.title || "";
+  const queryReady = !!show;
+
+  // Map first; fall back to ?mid/?aid threaded from search (map may miss).
+  const routeAnime = useMemo(() => {
+    if (!routeParams.mid) return null;
+    const malId = Number(routeParams.mid);
+    if (!Number.isFinite(malId)) return null;
+    const aid = routeParams.aid ? Number(routeParams.aid) : null;
+    return {
+      malId,
+      anilistId: aid != null && Number.isFinite(aid) ? aid : null,
+    };
+  }, [routeParams.mid, routeParams.aid]);
+  const animeHit = useMemo(() => {
+    const mapHit = id ? resolveShowIds(id) : null;
+    // Map is authoritative for the MAL id; search-threaded aid fills the gap
+    // when the map entry has no AniList id.
+    if (mapHit)
+      return {
+        malId: mapHit.malId,
+        anilistId: mapHit.anilistId ?? routeAnime?.anilistId ?? null,
+      };
+    return routeAnime;
+  }, [id, routeAnime]);
+  const isAnime = animeHit != null;
+
+  const [bookmarked, setBookmarked] = useState(false);
+  const [resumeState, setResumeState] = useState<WatchProgress | null>(null);
+  const [downloadSheetOpen, setDownloadSheetOpen] = useState(false);
+  const downloadSummary = useMediaDownloadState("tv", String(id));
+  // Detail viewing dwelling time tracking.
+  const detailEnteredAt = useRef(Date.now());
+  const detailTrackedRef = useRef(false);
+
+  // FIX 7: rank-option deps are value-level; selection re-prefetch debounced 500ms.
+  // B1: prefetch only while focused — defer rank changes until next focus.
+  const rankSig = `${settings.cellularMaxMB}|${settings.maxQuality}|${settings.preferredAudioLanguage}|${settings.defaultServer}`;
+  const lastRankSigRef = useRef<string | null>(null);
+  const pendingRankSigRef = useRef<string | null>(null);
+  // D1: provider this details page resolved — Watch always passes it via ?provider=.
+  const resolvedProviderRef = useRef<string | null>(null);
+  // D3: set true when Watch is pressed so unmount cleanup keeps the warm player.
+  const navigatedToWatchRef = useRef(false);
+  // D3: last cache key we held a warm player for (release on leave-without-watch).
+  const heldEarlyKeyRef = useRef<string | null>(null);
+  // D3: URL the current hold is on — READY skips re-holding the same head
+  // (a re-hold would release the already-warmed instance and start over).
+  const heldEarlyUrlRef = useRef<string | null>(null);
+  // Bookmark / resume loads stay mount-driven (not focus-gated).
+  useEffect(() => {
+    if (!id) return;
+    isBookmarked(id!).then(setBookmarked);
+    getResumePoint(id!, "tv").then((p) => {
+      if (p) {
+        setResumeState(p);
+        resumeSeasonRef.current = p.season ?? 1;
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
+  useFocusEffect(
+    useCallback(() => {
+      if (!id || !settingsLoaded) return;
+      // D3: each focus is a fresh visit — a prior Watch tap must not keep
+      // skipping the blur release forever (that orphaned a playing holder).
+      navigatedToWatchRef.current = false;
+      let cancelled = false;
+      let cleared = false;
+      // B1: apply rank changes deferred while unfocused, else current sig.
+      const sig = pendingRankSigRef.current ?? rankSig;
+      pendingRankSigRef.current = null;
+      const isFirst = lastRankSigRef.current === null;
+      lastRankSigRef.current = sig;
+      const delay = isFirst ? 0 : 500;
+      // Prefer the resume episode when known; otherwise first episode.
+      const season = resumeSeasonRef.current ?? 1;
+      const timer = setTimeout(() => {
+        if (cancelled || cleared) return;
+        resolvePlaybackProviderId({
+          mediaType: "tv",
+          tmdbId: parseInt(id),
+          savedServer: settings.defaultServer,
+        })
+          .then((providerId) => {
+            if (!providerId || cancelled || cleared) return;
+            resolvedProviderRef.current = providerId;
+            const key = `tv:${parseInt(id)}:s${season}:e1:${providerId}`;
+            return prefetchStreams(parseInt(id), "tv", season, 1, {
+              cellularMaxMB: settings.cellularMaxMB,
+              maxQuality: settings.maxQuality,
+              preferredAudioLanguage: settings.preferredAudioLanguage,
+              providerId,
+              trigger: "details",
+              // D3: hold at RANK (unverified head) — the head walk runs
+              // while the native player warms; READY reconciles below if
+              // the walk advances the head.
+              onEarlyHead: (head) => {
+                // Blur cancels the chain, but if the user already tapped
+                // Watch the holder is FOR the watch screen (adopts on next
+                // render) — hold anyway; the cleanup release still guards
+                // on navigatedToWatch so back-nav cannot orphan it.
+                // (cleared is set in the same cleanup as cancelled — must
+                // not bypass the Watch-tap exemption, matching movie/[id].)
+                if (cancelled && !navigatedToWatchRef.current) return;
+                if (holdEarlyPlayer(key, head)) {
+                  heldEarlyKeyRef.current = key;
+                  heldEarlyUrlRef.current = head.url;
+                }
+              },
+            })
+              .then((snap) => {
+                // D3: pipeline READY during details dwell → warm player on head.
+                if (
+                  (cancelled && !navigatedToWatchRef.current) ||
+                  !snap ||
+                  snap.links.length === 0
+                )
+                  return;
+                const head = snap.links[snap.bestIndex];
+                // RANK hold already sits on this exact head — keep the
+                // warmed instance instead of releasing it and starting over.
+                // hasEarlyPlayer guards stale refs: watch may have taken the
+                // holder since (back-navigation re-focus).
+                if (
+                  heldEarlyKeyRef.current === key &&
+                  heldEarlyUrlRef.current === head?.url &&
+                  hasEarlyPlayer(key)
+                )
+                  return;
+                if (holdEarlyPlayer(key, head)) {
+                  heldEarlyKeyRef.current = key;
+                  heldEarlyUrlRef.current = head?.url ?? null;
+                }
+              })
+              .catch((err) => {
+                console.log(`[TVDetail] Prefetch failed:`, err?.message);
+              });
+          })
+          .catch(() => {});
+      }, delay);
+      clearedTimerRef.current = () => {
+        cleared = true;
+        clearTimeout(timer);
+      };
+      return () => {
+        cancelled = true;
+        clearedTimerRef.current?.();
+        clearedTimerRef.current = null;
+        // D3: left details without navigating to watch → release the warm player.
+        if (!navigatedToWatchRef.current && heldEarlyKeyRef.current) {
+          releaseEarlyPlayer(heldEarlyKeyRef.current);
+          heldEarlyKeyRef.current = null;
+          heldEarlyUrlRef.current = null;
+        }
+      };
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [id, settingsLoaded, rankSig]),
+  );
+  // Track rank changes while unfocused so next focus re-prefetches with them.
+  useEffect(() => {
+    if (lastRankSigRef.current !== null && lastRankSigRef.current !== rankSig) {
+      pendingRankSigRef.current = rankSig;
+    }
+  }, [rankSig]);
+  const clearedTimerRef = useRef<(() => void) | null>(null);
+
+  const toggleBookmark = useCallback(async () => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+    const next = !bookmarked;
+    setBookmarked(next);
+    trackFeatureUsed("bookmark_save", "detail");
+    if (next) {
+      debouncedSaveBookmark({
+        tmdbId: id!,
+        mediaType: "tv",
+        title: header?.title || "",
+        posterPath: header?.poster_path ?? null,
+        year: (header?.release_date ?? "").split("-")[0] ?? "",
+        addedAt: Date.now(),
+      });
+      prefetchArtwork({
+        poster_path: header?.poster_path,
+        backdrop_path: header?.backdrop_path,
+      });
+      downloadToast.success("Saved to Library", 2500);
+    } else {
+      debouncedRemoveBookmark(id!);
+      downloadToast.info("Removed from Saved", 2000);
+    }
+  }, [id, bookmarked, header]);
+
+  const handleShare = useCallback(() => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+    trackFeatureUsed("share_used", "detail");
+    Share.share({
+      message: `Check out "${title}" on MOVIE HUB 🎬\nhttps://filmsnap-pro.netlify.app/tv/${id}`,
+    });
+  }, [id, title]);
+
+  const handleDownloadServer = useCallback(
+    (server: string) => {
+      const qs = new URLSearchParams({
+        poster: header?.poster_path || "",
+        backdrop: header?.backdrop_path || "",
+        provider: server,
+      }).toString();
+      nav.push(`/download/tv/${id}?${qs}`);
+    },
+    [id, nav, header?.poster_path, header?.backdrop_path],
+  );
+
+  // Accent derived from the backdrop, with the poster as a fast first paint
+  // (w342 poster swatch lands in ~200–400ms vs 1–3s for the w1280 backdrop).
+  // Called before the early returns below so the hook keeps its call order
+  // across skeleton → loaded transitions.
+  const theme = useMovieTheme(
+    header?.backdrop_path ?? null,
+    header?.poster_path ?? null,
+  );
+
+  // Track detail viewing dwelling time — fires when the page is visible.
+  useEffect(() => {
+    detailEnteredAt.current = Date.now();
+    detailTrackedRef.current = false;
+    const updateDwelling = () => {
+      if (detailTrackedRef.current) return;
+      const elapsed = Date.now() - detailEnteredAt.current;
+      const bucket =
+        elapsed < 3000
+          ? "<3"
+          : elapsed < 10000
+            ? "3-10"
+            : elapsed < 30000
+              ? "10-30"
+              : "30+";
+      trackDetailViewed({
+        sessionId: getSessionId(),
+        screen: "detail_tv",
+        tmdbId: parseInt(id),
+        mediaType: "tv",
+        fromTab: "home",
+        dwellingSecondsBucket: bucket as "<3" | "3-10" | "10-30" | "30+",
+      });
+      detailTrackedRef.current = true;
+    };
+    const timer = setTimeout(updateDwelling, 3000);
+    return () => clearTimeout(timer);
+  }, [id]);
+
+  // M1 — impression measurement: candidate ad slot on the detail page,
+  // between the action buttons row and the overview text (above the fold).
+  // key=id so title A → title B counts as two page impressions.
+  useSlotImpression("detail_above_overview", "detail_tv", { key: id });
+
+  // Deep link / cold route with no header params → full skeleton until data.
+  if (!header && isLoading) {
+    return <DetailSkeleton />;
+  }
+
+  if (!header && !isLoading) {
+    return (
+      <View
+        className="flex-1 items-center justify-center bg-void"
+        style={{ backgroundColor: colors.bg }}
+        onLayout={() => markDetailFirstFrame()}
+      >
+        <Ionicons name="tv-outline" size={48} color={colors.textTertiary} />
+        <Text className="text-text-secondary mt-3">
+          {isError ? "Couldn't load show" : "Show not found"}
+        </Text>
+      </View>
+    );
+  }
+
+  const year =
+    (show?.first_air_date || header?.release_date)?.split("-")[0] ?? "";
+  const genres = show?.genres ?? [];
+  const trailerKey = show ? getTrailerKey(show.videos) : null;
+  const cast = show?.credits?.cast?.slice(0, 10) ?? [];
+  const seasonCount =
+    show?.seasons?.filter((s: any) => s.season_number > 0).length ?? 0;
+  const backdropPath = header?.backdrop_path ?? null;
+  const posterPath = header?.poster_path ?? null;
+  const voteAverage = header?.vote_average ?? null;
+
+  const airDateStr = show?.first_air_date || header?.release_date || "";
+  const eligibility = getContentEligibility({
+    releaseDate: airDateStr,
+    status: show?.status,
+  });
+
+  const ctaLabel =
+    eligibility.status === "UPCOMING"
+      ? eligibility.badgeText
+      : resumeState && resumeState.percent >= 0.95
+        ? "Watch Again"
+        : resumeState && resumeState.percent > 0
+          ? `Resume S${resumeState.season} E${resumeState.episode}`
+          : "Play S1 E1";
+
+  // Single flat CTA — the control snaps to the accent in one frame while the
+  // big wash crossfades, so the two never alpha-blend into a muddy middle.
+  const renderCtaContent = (color: string) => (
+    <>
+      <Ionicons
+        name={eligibility.isPlayable ? "play" : "calendar-outline"}
+        size={18}
+        color={color}
+        style={{ marginRight: 8 }}
+      />
+      <Text style={{ fontFamily: "Inter_600SemiBold", fontSize: 15, color }}>
+        {ctaLabel}
+      </Text>
+    </>
+  );
+
+  return (
+    <View
+      className="flex-1 bg-void"
+      style={{ backgroundColor: colors.bg }}
+      onLayout={() => markDetailFirstFrame()}
+    >
+      {/* ── Floating Top Glass Navigation Bar ── */}
+      <View
+        style={{
+          position: "absolute",
+          top: insets.top + 8,
+          left: 16,
+          right: 16,
+          zIndex: 20,
+          flexDirection: "row",
+          alignItems: "center",
+          justifyContent: "space-between",
+        }}
+      >
+        {/* Back Button */}
+        <TouchableOpacity
+          onPress={() => nav.goBack({ fallback: "/(tabs)" })}
+          activeOpacity={0.75}
+          accessibilityLabel="Go back"
+          accessibilityRole="button"
+          style={{
+            width: 38,
+            height: 38,
+            borderRadius: 19,
+            backgroundColor: "rgba(14, 14, 17, 0.75)",
+            borderWidth: 0.5,
+            borderColor: "rgba(255, 255, 255, 0.15)",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <Ionicons name="chevron-back" size={20} color={colors.textPrimary} />
+        </TouchableOpacity>
+
+        {/* Right actions: Bookmark & Share */}
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+          <TouchableOpacity
+            onPress={toggleBookmark}
+            activeOpacity={0.75}
+            accessibilityLabel={
+              bookmarked ? "Saved in library" : "Save to library"
+            }
+            accessibilityRole="button"
+            style={{
+              width: 38,
+              height: 38,
+              borderRadius: 19,
+              backgroundColor: bookmarked
+                ? "rgba(212, 162, 55, 0.2)"
+                : "rgba(14, 14, 17, 0.75)",
+              borderWidth: 0.5,
+              borderColor: bookmarked
+                ? colors.gold
+                : "rgba(255, 255, 255, 0.15)",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            <Ionicons
+              name={bookmarked ? "bookmark" : "bookmark-outline"}
+              size={18}
+              color={bookmarked ? colors.gold : colors.textPrimary}
+            />
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            onPress={handleShare}
+            activeOpacity={0.75}
+            accessibilityLabel="Share"
+            accessibilityRole="button"
+            style={{
+              width: 38,
+              height: 38,
+              borderRadius: 19,
+              backgroundColor: "rgba(14, 14, 17, 0.75)",
+              borderWidth: 0.5,
+              borderColor: "rgba(255, 255, 255, 0.15)",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            <Ionicons
+              name="share-outline"
+              size={18}
+              color={colors.textPrimary}
+            />
+          </TouchableOpacity>
+        </View>
+      </View>
+
+      <Animated.ScrollView
+        showsVerticalScrollIndicator={false}
+        onScroll={Animated.event(
+          [{ nativeEvent: { contentOffset: { y: scrollY } } }],
+          { useNativeDriver: true },
+        )}
+        scrollEventThrottle={16}
+      >
+        {/* Backdrop with film grain */}
+        <View
+          style={{
+            width: SCREEN_WIDTH,
+            height: BACKDROP_HEIGHT,
+            position: "relative",
+          }}
+        >
+          {backdropPath ? (
+            <Animated.View
+              style={{
+                position: "absolute",
+                width: SCREEN_WIDTH,
+                height: BACKDROP_HEIGHT,
+                transform: [
+                  {
+                    translateY: scrollY.interpolate({
+                      inputRange: [-100, 0, 100],
+                      outputRange: [-30, 0, -30],
+                      extrapolate: "clamp",
+                    }),
+                  },
+                ],
+                opacity: scrollY.interpolate({
+                  inputRange: [0, BACKDROP_HEIGHT * 0.5],
+                  outputRange: [1, 0.85],
+                  extrapolate: "clamp",
+                }),
+              }}
+            >
+              <ProgressiveImage
+                uri={getImageUrl(backdropPath, DETAIL_BACKDROP_SIZE)}
+                style={{ width: SCREEN_WIDTH, height: BACKDROP_HEIGHT }}
+                resizeMode="cover"
+              />
+              {/* Tint (v11): flat uniform alpha plate inside this animated view
+                  (parallaxes with the photo); fades with accent progress. */}
+              {theme.hasAccent && (
+                <HeroTint
+                  tint={theme.palette.tint}
+                  progress={theme.progress}
+                  alpha={0.07}
+                />
+              )}
+            </Animated.View>
+          ) : (
+            <View
+              style={{
+                backgroundColor: colors.bgElevated,
+                position: "absolute",
+                top: 0,
+                left: 0,
+                right: 0,
+                bottom: 0,
+              }}
+            />
+          )}
+
+          {/* Film grain overlay */}
+          <FilmGrain opacity={0.03} />
+
+          {/* Cinematic gradient fade — the neutral scrim is PERMANENT. Both
+              layers are translucent, so unmounting it mid-stack would change
+              the composite and pop; it stays mounted forever. */}
+          <LinearGradient
+            colors={[
+              "rgba(7,7,8,0)",
+              "rgba(7,7,8,0)",
+              "rgba(7,7,8,0.50)",
+              "rgba(7,7,8,0.95)",
+            ]}
+            locations={[0, 0.35, 0.68, 1]}
+            start={{ x: 0, y: 0 }}
+            end={{ x: 0, y: 1 }}
+            style={{
+              position: "absolute",
+              bottom: 0,
+              left: 0,
+              right: 0,
+              height: BACKDROP_HEIGHT * 0.7,
+            }}
+            pointerEvents="none"
+          />
+          {theme.hasAccent && (
+            <Animated.View
+              pointerEvents="none"
+              style={{
+                position: "absolute",
+                bottom: 0,
+                left: 0,
+                right: 0,
+                height: BACKDROP_HEIGHT * 0.7,
+                opacity: theme.progress,
+              }}
+            >
+              <LinearGradient
+                colors={[
+                  "rgba(7,7,8,0)",
+                  "rgba(7,7,8,0)",
+                  theme.palette.mid,
+                  theme.palette.faded,
+                ]}
+                locations={[0, 0.35, 0.68, 1]}
+                start={{ x: 0, y: 0 }}
+                end={{ x: 0, y: 1 }}
+                style={{ flex: 1 }}
+              />
+            </Animated.View>
+          )}
+        </View>
+
+        {/* Accent wash pooling under the backdrop — IN-FLOW (phase 2).
+            Net-zero layout trick: marginTop -0.3H + height 1.2H, then the
+            content section's margin cancels the remaining 0.9H, so the
+            poster still overlaps the backdrop exactly as before while the
+            pool itself is a normal scroll child behind the header block.
+            It decays to pure bg ~0.8 screens down — nothing below is tinted,
+            and the page root stays neutral.
+
+            ALWAYS MOUNTED (transparent while there is no accent): the
+            content section's compensating margin is unconditional, so a
+            conditionally-mounted pool would pull the whole page up by
+            ~0.9 backdrop heights on titles that never get an accent — the
+            "everything moved up" bug. A static container keeps the layout
+            byte-identical in both states. */}
+        <View
+          pointerEvents="none"
+          style={{
+            marginTop: -BACKDROP_HEIGHT * 0.3,
+            height: BACKDROP_HEIGHT * 1.2,
+          }}
+        >
+          {theme.hasAccent && (
+            <Animated.View
+              pointerEvents="none"
+              style={{ flex: 1, opacity: theme.progress }}
+            >
+              <LinearGradient
+                colors={["rgba(7,7,8,0)", theme.palette.glow, "rgba(7,7,8,0)"]}
+                locations={[0, 0.5, 1]}
+                start={{ x: 0.5, y: 0 }}
+                end={{ x: 0.5, y: 1 }}
+                style={{ flex: 1 }}
+              />
+            </Animated.View>
+          )}
+        </View>
+
+        {/* Content Section — margin cancels the pool's in-flow footprint
+            (see above) so the poster still overlaps the backdrop. */}
+        <View
+          className="px-4"
+          style={{
+            marginTop: -(BACKDROP_HEIGHT * 0.9 + POSTER_OVERLAP),
+          }}
+        >
+          {/* Poster + Info row */}
+          <View className="flex-row items-center">
+            {/* Elevated Poster */}
+            {posterPath ? (
+              <ProgressiveImage
+                uri={getImageUrl(posterPath, "w342")}
+                style={{
+                  width: POSTER_WIDTH,
+                  height: POSTER_WIDTH * 1.5,
+                  borderRadius: 12,
+                  borderWidth: 0.5,
+                  borderColor: colors.borderSubtle,
+                  ...Platform.select({
+                    ios: {
+                      shadowColor: "#000",
+                      shadowOffset: { width: 0, height: 8 },
+                      shadowOpacity: 0.55,
+                      shadowRadius: 14,
+                    },
+                    android: { elevation: 12 },
+                  }),
+                }}
+                resizeMode="cover"
+              />
+            ) : (
+              <View
+                className="items-center justify-center"
+                style={{
+                  width: POSTER_WIDTH,
+                  height: POSTER_WIDTH * 1.5,
+                  borderRadius: 12,
+                  backgroundColor: colors.bgElevated,
+                  borderWidth: 0.5,
+                  borderColor: colors.borderSubtle,
+                }}
+              >
+                <Ionicons
+                  name="tv-outline"
+                  size={28}
+                  color={colors.textTertiary}
+                />
+              </View>
+            )}
+
+            {/* Info to the right of poster */}
+            <View style={{ flex: 1, marginLeft: 18, justifyContent: "center" }}>
+              <Text
+                style={{
+                  fontSize: 18,
+                  lineHeight: 22,
+                  fontFamily: "Inter_600SemiBold",
+                  color: colors.textPrimary,
+                  marginBottom: 6,
+                }}
+                numberOfLines={2}
+              >
+                {title}
+              </Text>
+
+              {/* Meta tags: Rating + Year + Seasons */}
+              <View
+                style={{
+                  flexDirection: "row",
+                  flexWrap: "wrap",
+                  alignItems: "center",
+                  gap: 6,
+                  marginBottom: 6,
+                }}
+              >
+                {voteAverage != null && voteAverage > 0 && (
+                  <View
+                    style={{
+                      backgroundColor: "rgba(212,162,55,0.15)",
+                      borderRadius: 6,
+                      paddingHorizontal: 7,
+                      paddingVertical: 2,
+                      flexDirection: "row",
+                      alignItems: "center",
+                      borderWidth: 0.5,
+                      borderColor: "rgba(212,162,55,0.3)",
+                    }}
+                  >
+                    <Text
+                      style={{
+                        color: colors.gold,
+                        fontSize: 11,
+                        fontFamily: "Inter_600SemiBold",
+                      }}
+                    >
+                      ★ {voteAverage.toFixed(1)}
+                    </Text>
+                  </View>
+                )}
+
+                {year ? (
+                  <View
+                    style={{
+                      backgroundColor: "rgba(255, 255, 255, 0.08)",
+                      borderRadius: 6,
+                      paddingHorizontal: 7,
+                      paddingVertical: 2,
+                    }}
+                  >
+                    <Text
+                      style={{
+                        color: colors.textSecondary,
+                        fontSize: 11,
+                        fontFamily: "Inter_500Medium",
+                      }}
+                    >
+                      {year}
+                    </Text>
+                  </View>
+                ) : null}
+
+                {queryReady && seasonCount > 0 && (
+                  <View
+                    style={{
+                      backgroundColor: "rgba(255, 255, 255, 0.08)",
+                      borderRadius: 6,
+                      paddingHorizontal: 7,
+                      paddingVertical: 2,
+                      flexDirection: "row",
+                      alignItems: "center",
+                      gap: 3,
+                    }}
+                  >
+                    <Ionicons
+                      name="layers-outline"
+                      size={12}
+                      color={colors.textTertiary}
+                    />
+                    <Text
+                      style={{
+                        color: colors.textSecondary,
+                        fontSize: 11,
+                        fontFamily: "Inter_500Medium",
+                      }}
+                    >
+                      {seasonCount} {seasonCount === 1 ? "Season" : "Seasons"}
+                    </Text>
+                  </View>
+                )}
+              </View>
+
+              {/* Genre badges — query-dependent */}
+              {queryReady && genres.length > 0 && (
+                <View className="flex-row flex-wrap" style={{ gap: 4 }}>
+                  {genres.slice(0, 3).map((g: { id: number; name: string }) => (
+                    <View
+                      key={g.id}
+                      style={{
+                        backgroundColor: colors.bgElevated,
+                        borderRadius: 6,
+                        paddingHorizontal: 7,
+                        paddingVertical: 2,
+                        borderWidth: 0.5,
+                        borderColor: colors.borderSubtle,
+                      }}
+                    >
+                      <Text
+                        style={{
+                          color: colors.textSecondary,
+                          fontSize: 10,
+                          fontFamily: "Inter_500Medium",
+                        }}
+                      >
+                        {g.name}
+                      </Text>
+                    </View>
+                  ))}
+                </View>
+              )}
+            </View>
+          </View>
+
+          {/* ── Action Buttons: Primary Watch + Secondary Quick Actions ── */}
+          <View style={{ marginTop: 18 }}>
+            {/* Primary Watch/Resume CTA — disabled for unreleased upcoming shows */}
+            <TouchableOpacity
+              disabled={!eligibility.isPlayable}
+              onPress={() => {
+                if (!eligibility.isPlayable) return;
+                const s = resumeState?.season ?? 1;
+                const e = resumeState?.episode ?? 1;
+                const base = `/watch/tv/${id}/${s}/${e}`;
+                const params = new URLSearchParams(
+                  resumeState &&
+                    resumeState.percent > 0 &&
+                    resumeState.percent < 0.95
+                    ? {
+                        t: String(Math.floor(resumeState.currentTime)),
+                        backdrop: backdropPath || "",
+                      }
+                    : { backdrop: backdropPath || "" },
+                );
+                const hit =
+                  isAnime && id
+                    ? (resolveShowIds(id, s) ?? animeHit)
+                    : animeHit;
+                if (hit) {
+                  params.set("isAnime", "1");
+                  params.set("mid", String(hit.malId));
+                  if (hit.anilistId != null)
+                    params.set("aid", String(hit.anilistId));
+                  params.set("audio", "sub");
+                }
+                // D1: always pass the provider this details page resolved so
+                // watch does one sync resolve — no async flip, no cancelled
+                // pipeline. Peek with the SAME provider id for the exact key.
+                const resolvedProvider = resolvedProviderRef.current;
+                if (resolvedProvider) {
+                  params.set("provider", resolvedProvider);
+                }
+                // FIX 5: hand the warm snapshot to watch; still runs trigger=watch.
+                const snap = peekPrefetchStreams(parseInt(id), "tv", s, e, {
+                  cellularMaxMB: settings.cellularMaxMB,
+                  maxQuality: settings.maxQuality,
+                  preferredAudioLanguage: settings.preferredAudioLanguage,
+                  providerId: resolvedProvider ?? undefined,
+                });
+                if (snap && snap.links.length > 0) {
+                  const head = snap.links[snap.bestIndex];
+                  setStreamHandoff(
+                    parseInt(id),
+                    "tv",
+                    s,
+                    e,
+                    resolvedProvider ?? head?._meta?.providerId ?? "direct",
+                    snap,
+                  );
+                  if (head?.url) params.set("streamUrl", head.url);
+                  params.set("bestIndex", String(snap.bestIndex));
+                }
+                // FIX 9: detailsTap opens the perf session before the player tree.
+                beginDetailsTap(`tv:${id}:s${s}e${e}`);
+                // D3: keep the warm player for adoption — don't release on unmount.
+                navigatedToWatchRef.current = true;
+                nav.push(`${base}?${params.toString()}`);
+              }}
+              activeOpacity={0.88}
+              style={{
+                backgroundColor: theme.palette.accent,
+                borderRadius: 12,
+                paddingVertical: 14,
+                flexDirection: "row",
+                alignItems: "center",
+                justifyContent: "center",
+                // shadow* only ever rendered on iOS; this build is Android-only.
+                elevation: 6,
+              }}
+            >
+              {renderCtaContent(theme.palette.accentText)}
+            </TouchableOpacity>
+
+            {/* Secondary Action Row: Trailer & Download */}
+            <View className="flex-row items-center mt-3" style={{ gap: 10 }}>
+              {queryReady && trailerKey ? (
+                <TouchableOpacity
+                  onPress={() => {
+                    trackFeatureUsed("trailer_open", "detail");
+                    setTrailerOpen(true);
+                  }}
+                  activeOpacity={0.75}
+                  style={{
+                    flex: 1,
+                    backgroundColor: "rgba(14, 14, 17, 0.8)",
+                    borderWidth: 1,
+                    borderColor: colors.borderSubtle,
+                    borderRadius: 12,
+                    paddingVertical: 11,
+                    flexDirection: "row",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    gap: 6,
+                  }}
+                >
+                  <Ionicons name="logo-youtube" size={16} color="#FF0000" />
+                  <Text
+                    style={{
+                      color: colors.textPrimary,
+                      fontSize: 13,
+                      fontFamily: "Inter_500Medium",
+                    }}
+                  >
+                    Trailer
+                  </Text>
+                </TouchableOpacity>
+              ) : null}
+
+              <TouchableOpacity
+                onPress={() => setDownloadSheetOpen(true)}
+                activeOpacity={0.75}
+                style={{
+                  flex: 1,
+                  backgroundColor: "rgba(14, 14, 17, 0.8)",
+                  borderWidth: 1,
+                  borderColor: colors.borderSubtle,
+                  borderRadius: 12,
+                  paddingVertical: 11,
+                  flexDirection: "row",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: 6,
+                }}
+              >
+                <Ionicons
+                  name="download-outline"
+                  size={16}
+                  color={colors.gold}
+                />
+                <Text
+                  style={{
+                    color: colors.textPrimary,
+                    fontSize: 13,
+                    fontFamily: "Inter_500Medium",
+                  }}
+                >
+                  Download
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+
+          {/* M2 — candidate ad slot between action buttons and overview.
+              Renders nothing until the remote ads-config enables it. */}
+          <AdSlot slot="detail_above_overview" />
+
+          {/* Overview — query-dependent */}
+          {queryReady && show.overview ? (
+            <View className="mt-6">
+              <Text
+                style={{
+                  fontSize: 15,
+                  fontFamily: "Inter_600SemiBold",
+                  marginBottom: 8,
+                  color: colors.textPrimary,
+                }}
+              >
+                Overview
+              </Text>
+              <Text
+                style={{
+                  color: colors.textSecondary,
+                  fontSize: 14,
+                  lineHeight: 21,
+                  fontFamily: "Inter_400Regular",
+                }}
+                numberOfLines={overviewExpanded ? undefined : 3}
+              >
+                {show.overview}
+              </Text>
+              {show.overview.length > 120 && (
+                <TouchableOpacity
+                  onPress={() => setOverviewExpanded(!overviewExpanded)}
+                  activeOpacity={0.7}
+                  style={{ marginTop: 4 }}
+                >
+                  <Text
+                    style={{
+                      color: colors.gold,
+                      fontSize: 12,
+                      fontFamily: "Inter_500Medium",
+                    }}
+                  >
+                    {overviewExpanded ? "Show less" : "Read more"}
+                  </Text>
+                </TouchableOpacity>
+              )}
+            </View>
+          ) : null}
+
+          {/* Season picker (TV only) — query-dependent */}
+          {queryReady && (
+            <SeasonPicker
+              tmdbId={id!}
+              title={show.name}
+              posterPath={show.poster_path}
+              downloadSummary={downloadSummary}
+              seasons={(show.seasons ?? [])
+                .filter((s: any) => s.season_number > 0 && s.episode_count > 0)
+                .map((s: any) => ({
+                  seasonNumber: s.season_number,
+                  episodeCount: s.episode_count,
+                  name: s.name ?? `Season ${s.season_number}`,
+                }))}
+              initialSeason={
+                resumeState?.season ?? resumeSeasonRef.current ?? 1
+              }
+              backdropPath={show.backdrop_path}
+              // Phase 2 (optional): active-chip hairline in the title's
+              // faded accent — only while a real accent is live.
+              activeHairline={theme.hasAccent ? theme.palette.faded : undefined}
+            />
+          )}
+
+          {/* Cast — query-dependent */}
+          {queryReady && cast.length > 0 && (
+            <CastCarousel cast={show.credits.cast} />
+          )}
+
+          {/* More Like This — query-dependent. Prefer TMDB's own
+              /recommendations engine (what the TMDB website renders, and
+              what reads as dramatically better than /similar); fall back to
+              /similar for thin catalogs. */}
+          {queryReady &&
+            ((show.recommendations?.results?.length ?? 0) > 0 ||
+              (show.similar?.results?.length ?? 0) > 0) && (
+              <View className="mt-6">
+                <MediaCarousel
+                  title="More Like This"
+                  data={
+                    (show.recommendations?.results?.length ?? 0) > 0
+                      ? show.recommendations.results
+                      : show.similar.results
+                  }
+                  onItemPressIn={(item) => {
+                    const navItem = toDetailNavItem(item, "tv");
+                    if (navItem)
+                      prepareDetail(navItem, "similar", queryClient, router);
+                  }}
+                  onItemPress={(item) => {
+                    const navItem = toDetailNavItem(item, "tv");
+                    if (navItem)
+                      openDetail(navItem, "similar", {
+                        queryClient,
+                        router,
+                        nav,
+                      });
+                  }}
+                />
+              </View>
+            )}
+
+          {/* Query-dependent placeholder while details load (params-only paint) */}
+          {!queryReady && !isLoading && isError && (
+            <View className="mt-6">
+              <Text style={{ color: colors.textSecondary, fontSize: 14 }}>
+                Details unavailable — check your connection.
+              </Text>
+            </View>
+          )}
+          {!queryReady && isLoading && (
+            <View className="mt-6" style={{ gap: 8 }}>
+              <View
+                style={{
+                  height: 14,
+                  width: "40%",
+                  borderRadius: 4,
+                  backgroundColor: colors.bgElevated,
+                }}
+              />
+              <View
+                style={{
+                  height: 12,
+                  width: "100%",
+                  borderRadius: 4,
+                  backgroundColor: colors.bgElevated,
+                }}
+              />
+              <View
+                style={{
+                  height: 12,
+                  width: "85%",
+                  borderRadius: 4,
+                  backgroundColor: colors.bgElevated,
+                }}
+              />
+            </View>
+          )}
+
+          <View style={{ height: 60 }} />
+        </View>
+      </Animated.ScrollView>
+
+      {/* Trailer Modal */}
+      <TrailerModal
+        videoKey={trailerKey}
+        open={trailerOpen}
+        onClose={() => setTrailerOpen(false)}
+      />
+
+      {/* Quality Picker Sheet */}
+      <DownloadSheet
+        visible={downloadSheetOpen}
+        onClose={() => setDownloadSheetOpen(false)}
+        mediaType="tv"
+        tmdbId={id!}
+        title={title}
+        onSelectServer={handleDownloadServer}
+        onManagePlugins={() => nav.push("/plugins")}
+      />
+    </View>
+  );
+}

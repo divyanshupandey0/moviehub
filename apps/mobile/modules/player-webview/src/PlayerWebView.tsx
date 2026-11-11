@@ -1,0 +1,96 @@
+import { requireNativeViewManager } from "expo-modules-core";
+import React from "react";
+import { StyleProp, ViewStyle } from "react-native";
+
+export interface PlayerWebViewMessage {
+  type: string;
+  [key: string]: any;
+}
+
+export interface PlayerWebViewProps {
+  source: { uri: string; headers?: Record<string, string> };
+  userAgent?: string;
+  injectedJavaScriptBeforeContentLoaded?: string;
+  /** Re-injected on every onPageFinished (ad-blocking scripts that must re-apply). */
+  injectedJavaScriptAfterLoad?: string;
+  allowsFullscreenVideo?: boolean;
+  style?: StyleProp<ViewStyle>;
+  onLoadingStart?: (event: { nativeEvent: { url: string } }) => void;
+  onLoadingFinish?: (event: { nativeEvent: { url: string } }) => void;
+  onHttpError?: (event: {
+    nativeEvent: { statusCode: number; description: string };
+  }) => void;
+  onMessage?: (event: { nativeEvent: { data: string } }) => void;
+  onRenderProcessGone?: (event: { nativeEvent: { didCrash: boolean } }) => void;
+  /** Provider home-page escape — the embed navigated toward a provider home/list
+   *  path (error-UI "Go Home"). Native already auto-reloaded once; escalation
+   *  here means show the existing FAILED overlay (Switch Source). */
+  onEscapeBlocked?: (event: { nativeEvent: { url: string } }) => void;
+  setSupportMultipleWindows?: boolean;
+  referrer?: string;
+  javaScriptCanOpenWindowsAutomatically?: boolean;
+  /** Phase 3: Domain Discovery / Audit Mode. When enabled, all network
+   *  request hosts are tracked and dispatched via onAuditData. */
+  auditMode?: boolean;
+  onAuditData?: (event: {
+    nativeEvent: { hosts: string; count: number; hostsDetailed: string };
+  }) => void;
+}
+
+export interface PlayerWebViewRef {
+  forceLoad: (url: string) => void;
+  reload: () => void;
+  stopLoading: () => void;
+  injectJavaScript: (script: string) => void;
+}
+
+// A module-scope requireNativeViewManager() throw happens during import, when
+// no ErrorBoundary can exist yet (native module not autolinked / OTA mismatch),
+// and it takes down the whole app. Fall back to a no-op view so the screen
+// renders and the error surfaces through the normal onLoadingStart/onHttpError
+// paths instead of a white screen.
+const NativeView: React.ComponentType<any> = (() => {
+  try {
+    return requireNativeViewManager("PlayerWebview");
+  } catch (e) {
+    console.warn("[PlayerWebView] native view unavailable:", e);
+    return React.forwardRef((_props: any, _ref: any) => null) as any;
+  }
+})();
+
+const PlayerWebView = React.forwardRef<PlayerWebViewRef, PlayerWebViewProps>(
+  (props, ref) => {
+    const nativeRef = React.useRef<any>(null);
+
+    const [forceLoadUrl, setForceLoadUrl] = React.useState("");
+    const [forceReload, setForceReload] = React.useState(0);
+    const [forceStop, setForceStop] = React.useState(0);
+    const [injectedJS, setInjectedJS] = React.useState("");
+
+    React.useImperativeHandle(ref, () => ({
+      forceLoad: (url: string) => setForceLoadUrl(url),
+      reload: () => setForceReload(Date.now()),
+      stopLoading: () => setForceStop(Date.now()),
+      injectJavaScript: (script: string) => {
+        // Append a unique comment to bust the native deduplication cache
+        // so identical seek scripts evaluate properly on multiple calls.
+        setInjectedJS(`${script}\n//${Date.now()}`);
+      },
+    }));
+
+    return (
+      <NativeView
+        {...props}
+        ref={nativeRef}
+        forceLoadUrl={forceLoadUrl}
+        forceReload={forceReload}
+        forceStop={forceStop}
+        injectedJavaScript_={injectedJS}
+      />
+    );
+  },
+);
+
+PlayerWebView.displayName = "PlayerWebView";
+
+export default PlayerWebView;
